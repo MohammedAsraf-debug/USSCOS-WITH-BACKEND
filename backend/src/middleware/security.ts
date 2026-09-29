@@ -32,6 +32,11 @@ export function applySecurity(app: Express, allowedOrigins: string[]): void {
         if (!origin) return cb(null, true);
         return allowedOrigins.includes(origin) ? cb(null, true) : cb(new Error("Origin not allowed"));
       },
+      // Required: the frontend payment client fetches with credentials:"include".
+      // Browsers reject credentialed responses unless the exact (never "*")
+      // origin is echoed together with this flag. Unknown origins are still
+      // rejected by the explicit allowlist check above.
+      credentials: true,
       methods: ["GET", "POST", "OPTIONS"],
       allowedHeaders: ["Content-Type", "Authorization"],
     }),
@@ -53,4 +58,9 @@ export function paymentLimiter() {
 
 export function documentLimiter() {
   return rateLimit({ windowMs: 15 * 60 * 1000, limit: 120, standardHeaders: "draft-7", legacyHeaders: false });
+}
+
+/** Tight window for privileged admin-user management. */
+export function adminLimiter() {
+  return rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: "draft-7", legacyHeaders: false });
 }

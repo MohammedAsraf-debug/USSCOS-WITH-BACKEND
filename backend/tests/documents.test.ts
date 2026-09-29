@@ -1,7 +1,7 @@
 import request from "supertest";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
-import { FakeRazorpay, FakeVerifier, MemoryFirestoreGateway, athleteSubmission, testConfig } from "./fakes.js";
+import { FakeAdminAuth, FakeRazorpay, FakeVerifier, MemoryFirestoreGateway, athleteSubmission, testConfig } from "./fakes.js";
 
 const PDF = Buffer.from([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34, 0x0a, 0x25, 0xe2, 0xe3]);
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
@@ -15,6 +15,7 @@ function setup(tokens: Record<string, string> = {}) {
     verifier: new FakeVerifier(tokens),
     razorpay: new FakeRazorpay(),
     storagePath,
+    users: new FakeAdminAuth(),
   });
   return { app, gateway };
 }

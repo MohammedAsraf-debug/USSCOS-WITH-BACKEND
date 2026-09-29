@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import { APPLICATIONS_COLLECTION } from "../src/services/applications.js";
 import { CAPABILITY_COLLECTION } from "../src/services/capabilities.js";
-import { FakeRazorpay, FakeVerifier, MemoryFirestoreGateway, academySubmission, athleteSubmission, testConfig } from "./fakes.js";
+import { FakeAdminAuth, FakeRazorpay, FakeVerifier, MemoryFirestoreGateway, academySubmission, athleteSubmission, testConfig } from "./fakes.js";
 
 function setup() {
   const gateway = new MemoryFirestoreGateway();
@@ -13,6 +13,7 @@ function setup() {
     verifier: new FakeVerifier(),
     razorpay: new FakeRazorpay(),
     storagePath: testConfig().privateStoragePath,
+    users: new FakeAdminAuth(),
   });
   return { app, gateway };
 }

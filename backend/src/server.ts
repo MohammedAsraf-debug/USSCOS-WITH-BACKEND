@@ -1,3 +1,8 @@
+// Load backend/.env first: ESM evaluates imports depth-first in order, so
+// dotenv populates process.env before config/env.ts is ever read. Existing
+// process variables win (dotenv never overrides), which keeps hosted
+// environments working unchanged.
+import "dotenv/config";
 import { pathToFileURL } from "node:url";
 import { mkdir } from "node:fs/promises";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
@@ -12,6 +17,7 @@ import {
 } from "./app.js";
 import { hasFirebaseCredentials, hasRazorpayCredentials } from "./config/env.js";
 import type { RazorpayGateway } from "./services/razorpay.js";
+import { FirebaseAdminUserGateway } from "./services/admin-users.js";
 
 async function boot(): Promise<void> {
   const config = loadConfig();
@@ -30,6 +36,7 @@ async function boot(): Promise<void> {
   }
   const gateway = new AdminFirestoreGateway(getFirestore());
   const verifier = new AdminTokenVerifier(getAuth());
+  const users = new FirebaseAdminUserGateway(getAuth());
   let razorpay: RazorpayGateway | null = null;
   if (hasRazorpayCredentials(config)) {
     razorpay = new HttpRazorpayGateway(config.razorpayKeyId, config.razorpayKeySecret);
@@ -37,7 +44,7 @@ async function boot(): Promise<void> {
     console.warn("Razorpay credentials missing: payment endpoints will return 503 NOT_CONFIGURED.");
   }
   await mkdir(config.privateStoragePath, { recursive: true });
-  const app = createApp({ config, gateway, verifier, razorpay, storagePath: config.privateStoragePath });
+  const app = createApp({ config, gateway, verifier, razorpay, storagePath: config.privateStoragePath, users });
   app.listen(config.port, () => {
     console.log(`usscos-backend listening on :${config.port} (env=${config.nodeEnv})`);
   });

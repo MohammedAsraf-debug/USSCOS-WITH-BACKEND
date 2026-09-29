@@ -8,6 +8,8 @@ import { HttpRazorpayGateway, type RazorpayGateway } from "./services/razorpay.j
 import { applicationsRouter } from "./routes/applications.js";
 import { documentsRouter } from "./routes/documents.js";
 import { paymentsRouter } from "./routes/payments.js";
+import { adminUsersRouter } from "./routes/admin-users.js";
+import type { AdminAuthGateway } from "./services/admin-users.js";
 
 export interface AppDeps {
   config: BackendConfig;
@@ -15,6 +17,7 @@ export interface AppDeps {
   verifier: TokenVerifier;
   razorpay: RazorpayGateway | null;
   storagePath: string;
+  users: AdminAuthGateway;
 }
 
 /**
@@ -41,6 +44,7 @@ export function createApp(deps: AppDeps): Express {
   });
 
   app.use(applicationsRouter(deps.gateway));
+  app.use(adminUsersRouter({ gateway: deps.gateway, users: deps.users, verifier: deps.verifier }));
   app.use(
     documentsRouter({ gateway: deps.gateway, verifier: deps.verifier, storagePath: deps.storagePath }),
   );
@@ -55,6 +59,7 @@ export function createApp(deps: AppDeps): Express {
       minPaise: Math.round(deps.config.minAmountInr * 100),
       maxPaise: Math.round(deps.config.maxAmountInr * 100),
       turnstileSecret: deps.config.turnstileSecret,
+      debug: deps.config.nodeEnv !== "production",
     }),
   );
 

@@ -2,7 +2,7 @@ import { createHmac } from "node:crypto";
 import request from "supertest";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
-import { FakeRazorpay, FakeVerifier, MemoryFirestoreGateway, testConfig } from "./fakes.js";
+import { FakeAdminAuth, FakeRazorpay, FakeVerifier, MemoryFirestoreGateway, testConfig } from "./fakes.js";
 
 const KEY_SECRET = "test_secret";
 const WEBHOOK_SECRET = "test_webhook_secret";
@@ -37,6 +37,7 @@ function setup() {
     verifier: new FakeVerifier({ "admin-token": "admin-1", "cm-token": "cm-1" }),
     razorpay,
     storagePath: testConfig().privateStoragePath,
+    users: new FakeAdminAuth(),
   });
   return { app, gateway, razorpay };
 }
@@ -181,9 +182,46 @@ describe("payments", () => {
       verifier: new FakeVerifier(),
       razorpay: null,
       storagePath: testConfig().privateStoragePath,
+      users: new FakeAdminAuth(),
     });
     const res = await request(plain).post("/api/payments/orders").send(orderBody());
     expect(res.status).toBe(503);
     expect(res.body.code).toBe("NOT_CONFIGURED");
+  });
+
+  it("surfaces upstream gateway detail outside production (diagnosable 502)", async () => {
+    razorpay.failCreateOrderWith = {
+      status: 401,
+      code: "BAD_REQUEST_ERROR",
+      description: "Authentication failed",
+    };
+    const res = await request(app).post("/api/payments/orders").send(orderBody({ idempotencyKey: "idem-gwdetail-1" }));
+    expect(res.status).toBe(502);
+    expect(res.body.code).toBe("GATEWAY_ERROR");
+    expect(res.body.gatewayStatus).toBe(401);
+    expect(res.body.gatewayCode).toBe("BAD_REQUEST_ERROR");
+    expect(res.body.gatewayDescription).toBe("Authentication failed");
+  });
+
+  it("keeps the generic 502 body in production (no upstream detail)", async () => {
+    const prod = createApp({
+      config: testConfig({ nodeEnv: "production" }),
+      gateway: new MemoryFirestoreGateway(),
+      verifier: new FakeVerifier(),
+      razorpay,
+      storagePath: testConfig().privateStoragePath,
+      users: new FakeAdminAuth(),
+    });
+    razorpay.failCreateOrderWith = {
+      status: 401,
+      code: "BAD_REQUEST_ERROR",
+      description: "Authentication failed",
+    };
+    const res = await request(prod).post("/api/payments/orders").send(orderBody({ idempotencyKey: "idem-gwprod-1" }));
+    expect(res.status).toBe(502);
+    expect(res.body.code).toBe("GATEWAY_ERROR");
+    expect(res.body.gatewayStatus).toBeUndefined();
+    expect(res.body.gatewayCode).toBeUndefined();
+    expect(res.body.gatewayDescription).toBeUndefined();
   });
 });

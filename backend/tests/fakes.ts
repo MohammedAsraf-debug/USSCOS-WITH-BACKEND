@@ -89,8 +89,17 @@ export class FakeRazorpay implements RazorpayGateway {
   };
   public refundEntity: Record<string, unknown> = { id: "rfnd_test1", status: "processed", amount: 50000 };
   public failCreateOrder = false;
+  public failCreateOrderWith: { status: number; code: string; description: string } | null = null;
 
   async createOrder(input: { amountPaise: number; currency: string; receipt: string; notes: Record<string, string> }): Promise<{ id: string }> {
+    if (this.failCreateOrderWith) {
+      const { RazorpayGatewayError } = await import("../src/services/razorpay.js");
+      throw new RazorpayGatewayError(
+        this.failCreateOrderWith.status,
+        this.failCreateOrderWith.code,
+        this.failCreateOrderWith.description,
+      );
+    }
     if (this.failCreateOrder) throw new Error("gateway down");
     this.orders.push({ ...input });
     return { id: "order_test1" };
@@ -105,8 +114,7 @@ export class FakeRazorpay implements RazorpayGateway {
   }
 }
 
-export function testConfig(overrides: Partial<BackendConfig> = {}): BackendConfig {
-  return {
+export function testConfig(overrides: Partial<BackendConfig> = {}): BackendConfig {  return {
     nodeEnv: "test",
     port: 0,
     frontendOrigins: [],
@@ -152,4 +160,30 @@ export function academySubmission(nonce: string): Record<string, unknown> {
       { id: "doc-rep-001", documentCategory: "representative-id", documentType: "aadhaar-card", fileName: "rep.pdf", fileSizeBytes: 2345, fileType: "application/pdf" },
     ],
   };
+}
+
+/** Scriptable Firebase Auth fake for admin-user creation (no network). */
+export class FakeAdminAuth {
+  public created: Array<{ email: string; password: string; displayName: string }> = [];
+  public deleted: string[] = [];
+  public nextUid = "admin-uid-1";
+  /** Throw this error object from createUser (e.g. { code: "auth/email-already-exists" }). */
+  public createError: unknown = null;
+  public deleteError: unknown = null;
+  /** Fail the Nth Firestore-independent step: not used here (see gateway fakes). */
+  public failDelete = false;
+
+  async createUser(input: { email: string; password: string; displayName: string }): Promise<{ uid: string }> {
+    if (this.createError) throw this.createError;
+    this.created.push({ ...input });
+    const uid = this.nextUid;
+    this.nextUid = `admin-uid-${this.created.length + 1}`;
+    return { uid };
+  }
+
+  async deleteUser(uid: string): Promise<void> {
+    if (this.deleteError) throw this.deleteError;
+    if (this.failDelete) throw new Error("delete failed");
+    this.deleted.push(uid);
+  }
 }

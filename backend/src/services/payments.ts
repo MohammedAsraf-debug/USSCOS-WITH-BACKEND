@@ -5,6 +5,7 @@ import { requireStaff } from "./auth.js";
 import {
   verifyPaymentSignature,
   verifyWebhookSignature,
+  RazorpayGatewayError,
   type RazorpayGateway,
 } from "./razorpay.js";
 
@@ -131,6 +132,34 @@ export interface PaymentServiceDeps {
   maxPaise: number;
   turnstileSecret: string;
   verifier: TokenVerifier;
+  /**
+   * True outside production: gateway failures then carry the upstream HTTP
+   * status plus Razorpay's own error code/description (which contain no
+   * secrets), so a 502 is diagnosable instead of opaque. Production keeps
+   * the generic message.
+   */
+  debug: boolean;
+}
+
+/**
+ * 502 for a Razorpay gateway failure. Production-safe by default; in debug
+ * mode the upstream status/code/description ride along (Razorpay error
+ * bodies never contain credentials).
+ */
+function gatewayFailure(debug: boolean, fallbackMessage: string, cause: unknown): ServiceOutcome {
+  if (debug && cause instanceof RazorpayGatewayError) {
+    return {
+      status: 502,
+      body: {
+        code: "GATEWAY_ERROR",
+        message: fallbackMessage,
+        gatewayStatus: cause.status,
+        gatewayCode: cause.code,
+        gatewayDescription: cause.description,
+      },
+    };
+  }
+  return err(502, "GATEWAY_ERROR", fallbackMessage);
 }
 
 async function verifyTurnstile(secret: string, token: string): Promise<boolean> {
@@ -220,8 +249,8 @@ export async function createOrderFlow(deps: PaymentServiceDeps, body: Record<str
       receipt,
       notes: { purpose: input.purpose, idempotencyKey: input.idempotencyKey },
     }));
-  } catch {
-    return err(502, "GATEWAY_ERROR", "Razorpay order creation failed");
+  } catch (err) {
+    return gatewayFailure(deps.debug, "Razorpay order creation failed", err);
   }
   if (!orderId) return err(502, "GATEWAY_ERROR", "Razorpay returned no order id");
   const doc = {
@@ -311,8 +340,8 @@ export async function verifyFlow(
   let payment: Record<string, unknown> | null;
   try {
     payment = await deps.razorpay.fetchPayment(paymentId);
-  } catch {
-    return err(502, "GATEWAY_ERROR", "Razorpay payment fetch failed");
+  } catch (err) {
+    return gatewayFailure(deps.debug, "Razorpay payment fetch failed", err);
   }
   if (!payment) return err(404, "PAYMENT_NOT_FOUND", "Payment does not exist at Razorpay");
   if (String(payment.order_id ?? "") !== orderId) {
@@ -360,8 +389,8 @@ export async function refundFlow(
   let refund: Record<string, unknown>;
   try {
     refund = await deps.razorpay.createRefund(paymentId, Number(rec.amountPaise ?? 0));
-  } catch {
-    return err(502, "GATEWAY_ERROR", "Razorpay refund creation failed");
+  } catch (err) {
+    return gatewayFailure(deps.debug, "Razorpay refund creation failed", err);
   }
   const refundId = String(refund.id ?? "");
   const refundStatus = String(refund.status ?? "pending");

@@ -22,6 +22,8 @@ export interface PaymentRouteDeps {
   minPaise: number;
   maxPaise: number;
   turnstileSecret: string;
+  /** True outside production: gateway errors carry upstream detail. */
+  debug: boolean;
 }
 
 function depsOf(d: PaymentRouteDeps): PaymentServiceDeps | null {
@@ -35,6 +37,7 @@ function depsOf(d: PaymentRouteDeps): PaymentServiceDeps | null {
     maxPaise: d.maxPaise,
     turnstileSecret: d.turnstileSecret,
     verifier: d.verifier,
+    debug: d.debug,
   };
 }
 
