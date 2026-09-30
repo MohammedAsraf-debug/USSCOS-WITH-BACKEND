@@ -1,4 +1,6 @@
 import request from "supertest";
+import { readdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import { FakeAdminAuth, FakeRazorpay, FakeVerifier, MemoryFirestoreGateway, athleteSubmission, testConfig } from "./fakes.js";
@@ -17,7 +19,7 @@ function setup(tokens: Record<string, string> = {}) {
     storagePath,
     users: new FakeAdminAuth(),
   });
-  return { app, gateway };
+  return { app, gateway, storagePath };
 }
 
 async function submitAthlete(app: ReturnType<typeof createApp>, nonce: string) {
@@ -29,8 +31,9 @@ async function submitAthlete(app: ReturnType<typeof createApp>, nonce: string) {
 describe("private documents", () => {
   let app: ReturnType<typeof createApp>;
   let gateway: MemoryFirestoreGateway;
+  let storagePath: string;
   beforeEach(() => {
-    ({ app, gateway } = setup({
+    ({ app, gateway, storagePath } = setup({
       "admin-token": "admin-1",
       "super-token": "super-1",
       "cm-token": "cm-1",
@@ -236,5 +239,112 @@ describe("private documents", () => {
       .post("/api/documents/upload-token")
       .send({ applicationId, documentId: target.documentId });
     expect(res.status).toBe(404);
+  });
+
+  it("rejects a capability bound to a different application (no side effects)", async () => {
+    const a = await submitAthlete(app, "nonce-doc-scopeA-0001");
+    const b = await submitAthlete(app, "nonce-doc-scopeB-0001");
+    const capA = a.uploads[0] as { documentId: string; capability: string };
+    const docB = b.uploads[0] as { documentId: string };
+    const res = await request(app)
+      .post("/api/documents/upload")
+      .set("Authorization", `Upload ${capA.capability}`)
+      .field("applicationId", b.applicationId)
+      .field("documentId", docB.documentId)
+      .attach("file", PDF, "aadhaar.pdf");
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("INVALID_CAPABILITY");
+    // No file written, no metadata touched, no lease taken.
+    expect(readdirSync(storagePath)).toHaveLength(0);
+    const storedB = await gateway.get("sponsorshipRequests", b.applicationId);
+    for (const d of storedB?.documents as Array<Record<string, unknown>>) {
+      expect(d.status).toBe("recorded");
+      expect(d.storageRef).toBeNull();
+    }
+    const selector = capA.capability.split(".")[0] as string;
+    const cap = await gateway.get("privateUploadCapabilities", selector);
+    expect(cap?.claimedAt).toBeNull();
+  });
+
+  it("rejects a capability bound to a different document (no side effects)", async () => {
+    const { applicationId, uploads } = await submitAthlete(app, "nonce-doc-scopeC-0001");
+    const first = uploads[0] as { documentId: string; capability: string };
+    const second = uploads[1] as { documentId: string };
+    const res = await request(app)
+      .post("/api/documents/upload")
+      .set("Authorization", `Upload ${first.capability}`)
+      .field("applicationId", applicationId)
+      .field("documentId", second.documentId)
+      .attach("file", PDF, "aadhaar.pdf");
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("INVALID_CAPABILITY");
+    expect(readdirSync(storagePath)).toHaveLength(0);
+    const stored = await gateway.get("sponsorshipRequests", applicationId);
+    for (const d of stored?.documents as Array<Record<string, unknown>>) {
+      expect(d.status).toBe("recorded");
+    }
+  });
+
+  it("Firestore failure removes the partial file and releases the lease for retry", async () => {
+    const { applicationId, uploads } = await submitAthlete(app, "nonce-doc-fsuw-0001");
+    const target = uploads[0] as { documentId: string; capability: string };
+    const attempt = () =>
+      request(app)
+        .post("/api/documents/upload")
+        .set("Authorization", `Upload ${target.capability}`)
+        .field("applicationId", applicationId)
+        .field("documentId", target.documentId)
+        .attach("file", PDF, "aadhaar.pdf");
+    gateway.failNextUpdate = true;
+    const failed = await attempt();
+    expect(failed.status).toBe(500);
+    // Partial file cleaned up, metadata untouched, lease released.
+    expect(readdirSync(storagePath)).toHaveLength(0);
+    const stored = await gateway.get("sponsorshipRequests", applicationId);
+    const entry = (stored?.documents as Array<Record<string, unknown>>).find(
+      (d) => String(d.id) === target.documentId,
+    );
+    expect(entry?.status).toBe("recorded");
+    expect(entry?.storageRef).toBeNull();
+    const selector = target.capability.split(".")[0] as string;
+    expect((await gateway.get("privateUploadCapabilities", selector))?.claimedAt).toBeNull();
+    // Same token retries cleanly after the outage.
+    const retry = await attempt();
+    expect(retry.status).toBe(201);
+    expect(typeof retry.body.storageRef).toBe("string");
+  });
+
+  it("filesystem failure leaves metadata untouched and keeps the token retryable", async () => {
+    const { applicationId, uploads } = await submitAthlete(app, "nonce-doc-fsio-0001");
+    const target = uploads[0] as { documentId: string; capability: string };
+    // A regular file as storage root: directory creation must fail.
+    const blocker = path.join(storagePath, "blocker");
+    writeFileSync(blocker, "x");
+    const broken = createApp({
+      config: testConfig({ privateStoragePath: blocker }),
+      gateway,
+      verifier: new FakeVerifier(),
+      razorpay: new FakeRazorpay(),
+      storagePath: blocker,
+      users: new FakeAdminAuth(),
+    });
+    const attemptOn = (instance: ReturnType<typeof createApp>) =>
+      request(instance)
+        .post("/api/documents/upload")
+        .set("Authorization", `Upload ${target.capability}`)
+        .field("applicationId", applicationId)
+        .field("documentId", target.documentId)
+        .attach("file", PDF, "aadhaar.pdf");
+    const failed = await attemptOn(broken);
+    expect(failed.status).toBe(500);
+    const stored = await gateway.get("sponsorshipRequests", applicationId);
+    const entry = (stored?.documents as Array<Record<string, unknown>>).find(
+      (d) => String(d.id) === target.documentId,
+    );
+    expect(entry?.status).toBe("recorded");
+    expect(entry?.storageRef).toBeNull();
+    // Lease was released: the same token succeeds against healthy storage.
+    const retry = await attemptOn(app);
+    expect(retry.status).toBe(201);
   });
 });

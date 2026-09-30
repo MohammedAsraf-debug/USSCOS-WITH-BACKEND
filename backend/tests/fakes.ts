@@ -10,6 +10,8 @@ import type { BackendConfig } from "../src/config/env.js";
 export class MemoryFirestoreGateway implements FirestoreGateway {
   private readonly db = new Map<string, Map<string, Record<string, unknown>>>();
   private seq = 0;
+  /** When true, the next update() throws (fault injection for failure tests). */
+  public failNextUpdate = false;
 
   private col(name: string): Map<string, Record<string, unknown>> {
     let c = this.db.get(name);
@@ -33,6 +35,10 @@ export class MemoryFirestoreGateway implements FirestoreGateway {
   }
 
   async update(collection: string, id: string, patch: Record<string, unknown>): Promise<void> {
+    if (this.failNextUpdate) {
+      this.failNextUpdate = false;
+      throw new Error("firestore unavailable");
+    }
     const cur = this.col(collection).get(id);
     if (!cur) throw new Error("not-found");
     this.col(collection).set(id, { ...cur, ...patch });

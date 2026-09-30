@@ -103,21 +103,33 @@ export async function uploadDocument(
   }
   const storageRef = randomStorageRef(checked.ext);
   const target = path.join(storageRoot, storageRef);
-  await ensureStorageDir(storageRoot);
-  await writeFile(target, input.buffer, { mode: 0o600 });
   try {
-    await chmod(target, 0o600);
+    await ensureStorageDir(storageRoot);
+    await writeFile(target, input.buffer, { mode: 0o600 });
+    try {
+      await chmod(target, 0o600);
+    } catch {
+      /* best effort on non-POSIX filesystems */
+    }
   } catch {
-    /* best effort on non-POSIX filesystems */
+    // Filesystem failure before any metadata changed: remove partial bytes
+    // (best effort), release the lease so the same token stays retryable.
+    await unlink(target).catch(() => undefined);
+    await release();
+    return { ok: false, status: 500, code: "SERVER_ERROR", message: "Upload failed. Please try again." };
   }
   const stamped = new Date().toISOString();
+  let replacedRef = "";
   try {
-    await gateway.runTransaction(async (tx) => {
+    replacedRef = await gateway.runTransaction(async (tx) => {
       const current = await tx.get(APPLICATIONS_COLLECTION, input.applicationId);
       if (!current) throw new Error("application-gone");
       const currentDocs = Array.isArray(current.documents)
         ? (current.documents as Array<Record<string, unknown>>)
         : [];
+      const prior = currentDocs.find((d) => String(d.id ?? "") === input.documentId);
+      if (!prior) throw new Error("unknown-document");
+      const prevRef = typeof prior.storageRef === "string" ? prior.storageRef : "";
       const next = currentDocs.map((d) =>
         String(d.id ?? "") === input.documentId
           ? {
@@ -136,6 +148,7 @@ export async function uploadDocument(
         documents: next,
         updatedAt: stamped,
       });
+      return prevRef;
     });
   } catch {
     await unlink(target).catch(() => undefined);
@@ -143,6 +156,11 @@ export async function uploadDocument(
     return { ok: false, status: 500, code: "SERVER_ERROR", message: "Upload failed. Please try again." };
   }
   await consumeCapability(gateway, input.capability);
+  // Re-uploads replace the previous bytes: remove the orphaned file (strict
+  // shape check first so only server-generated references can be unlinked).
+  if (replacedRef && replacedRef !== storageRef && STORAGE_REF_PATTERN.test(replacedRef)) {
+    await unlink(path.join(storageRoot, replacedRef)).catch(() => undefined);
+  }
   return { ok: true, storageRef };
 }
 
