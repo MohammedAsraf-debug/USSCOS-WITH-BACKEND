@@ -27,20 +27,72 @@ const documentEntrySchema = z.object({
   fileType: z.string().optional().default(""),
 });
 
+/**
+ * Strict allowlist of the flat application fields the wizards send
+ * (exactly what buildSponsorshipRequestDoc emits, minus `documents` which
+ * travels separately). Unknown keys are REJECTED — the server, not the
+ * browser, decides the record shape. Server-owned fields below
+ * (type/status/consentGiven/…​) are accepted loosely and always overwritten
+ * on write; only fullName/email are contractually required.
+ */
+const applicationFieldsSchema = z
+  .object({
+    fullName: z.string().min(1).max(100),
+    email: z.string().min(1).max(254).email("Enter a valid email address"),
+    phone: z.string().min(1).max(32).nullable().optional(),
+    organization: z.string().max(200).nullable().optional(),
+    contactPerson: z.string().min(1).max(100).optional(),
+    story: z.string().max(10000).nullable().optional(),
+    sponsorshipNeeds: z.string().max(10000).nullable().optional(),
+    sport: z.string().max(100).nullable().optional(),
+    level: z.string().max(50).nullable().optional(),
+    location: z.string().max(200).nullable().optional(),
+    dateOfBirth: z.string().max(32).nullable().optional(),
+    currentRanking: z.string().max(200).nullable().optional(),
+    coach: z.string().max(100).nullable().optional(),
+    academy: z.string().max(200).nullable().optional(),
+    majorAchievements: z.string().max(10000).nullable().optional(),
+    upcomingCompetitions: z.string().max(10000).nullable().optional(),
+    amountRequested: z.number().nullable().optional(),
+    memberCount: z.number().int().nullable().optional(),
+    establishedYear: z.number().int().nullable().optional(),
+    contactRole: z.string().max(100).nullable().optional(),
+    coachCount: z.number().int().nullable().optional(),
+    coaches: z.string().max(10000).nullable().optional(),
+    competitions: z.string().max(10000).nullable().optional(),
+    website: z.string().max(500).nullable().optional(),
+    groupName: z.string().max(200).nullable().optional(),
+    socialMedia: z
+      .object({
+        instagram: z.string().max(500).optional(),
+        facebook: z.string().max(500).optional(),
+        linkedin: z.string().max(500).optional(),
+        other: z.string().max(500).optional(),
+      })
+      .strict()
+      .nullable()
+      .optional(),
+    type: z.string().max(32).optional(),
+    status: z.string().max(32).optional(),
+    consentGiven: z.boolean().optional(),
+    antiSpamToken: z.string().max(500).optional(),
+    formNonce: z.string().max(256).nullable().optional(),
+    createdAt: z.string().max(64).optional(),
+    updatedAt: z.string().max(64).optional(),
+  })
+  .strict();
+
 /** POST /api/applications payload (same shape the PHP service accepted). */
-export const submissionSchema = z.object({
-  requestFor: z.enum(["athlete", "group"]),
-  formNonce: z.string().min(16),
-  consentGiven: z.literal(true),
-  antiSpamToken: z.string().min(1),
-  application: z
-    .object({
-      fullName: z.string().min(1),
-      email: z.string().min(1),
-    })
-    .passthrough(),
-  documents: z.array(documentEntrySchema),
-});
+export const submissionSchema = z
+  .object({
+    requestFor: z.enum(["athlete", "group"]),
+    formNonce: z.string().min(16).max(256),
+    consentGiven: z.literal(true),
+    antiSpamToken: z.string().min(1).max(500),
+    application: applicationFieldsSchema,
+    documents: z.array(documentEntrySchema).max(20),
+  })
+  .strict();
 
 export type SubmissionInput = z.infer<typeof submissionSchema>;
 
