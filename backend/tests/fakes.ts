@@ -140,6 +140,8 @@ export class FakeRazorpay implements RazorpayGateway {
   public failCreateOrderWith: { status: number; code: string; description: string } | null = null;
   /** When set, order IDs are drawn from this queue (for multi-order tests). */
   public orderIdSequence: string[] = [];
+  /** Every refund call is recorded here (for duplicate-refund assertions). */
+  public refunds: Array<{ paymentId: string; amountPaise: number }> = [];
 
   async createOrder(input: { amountPaise: number; currency: string; receipt: string; notes: Record<string, string> }): Promise<{ id: string }> {
     if (this.failCreateOrderWith) {
@@ -160,6 +162,7 @@ export class FakeRazorpay implements RazorpayGateway {
   }
 
   async createRefund(_paymentId: string, amountPaise: number): Promise<Record<string, unknown>> {
+    this.refunds.push({ paymentId: _paymentId, amountPaise });
     return { ...this.refundEntity, amount: amountPaise };
   }
 }

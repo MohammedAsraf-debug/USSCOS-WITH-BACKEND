@@ -239,8 +239,7 @@ describe("payments", () => {
     expect(res.body.gatewayDescription).toBe("Authentication failed");
   });
 
-  it("keeps the generic 502 body in production (no upstream detail)", async () => {
-    const prod = createApp({
+  it("keeps the generic 502 body in production (no upstream detail)", async () => {    const prod = createApp({
       config: testConfig({ nodeEnv: "production" }),
       gateway: new MemoryFirestoreGateway(),
       verifier: new FakeVerifier(),
@@ -259,5 +258,321 @@ describe("payments", () => {
     expect(res.body.gatewayStatus).toBeUndefined();
     expect(res.body.gatewayCode).toBeUndefined();
     expect(res.body.gatewayDescription).toBeUndefined();
+  });
+});
+
+describe("payment security", () => {
+  let app: ReturnType<typeof createApp>;
+  let gateway: MemoryFirestoreGateway;
+  let razorpay: FakeRazorpay;
+  beforeEach(() => {
+    ({ app, gateway, razorpay } = setup());
+  });
+
+  async function createInit(key: string, overrides: Record<string, unknown> = {}) {
+    const res = await request(app).post("/api/payments/orders").send(orderBody({ idempotencyKey: key, ...overrides }));
+    expect(res.status).toBe(200);
+    return res.body as { order_id: string };
+  }
+
+  async function verifyOk(orderId = "order_test1", paymentId = "pay_test1") {
+    return request(app).post("/api/payments/verify").send({
+      orderId,
+      paymentId,
+      signature: sig(orderId, paymentId),
+    });
+  }
+
+  it("verify with an unknown orderId returns NOT_FOUND without side effects", async () => {
+    const res = await request(app).post("/api/payments/verify").send({
+      orderId: "order_nope",
+      paymentId: "pay_x",
+      signature: sig("order_nope", "pay_x"),
+    });
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe("NOT_FOUND");
+    expect(gateway.count("paymentRecords")).toBe(0);
+  });
+
+  it("a valid signature for a different order is rejected", async () => {
+    await createInit("idem-sec-wrongord");
+    const res = await request(app).post("/api/payments/verify").send({
+      orderId: "order_test1",
+      paymentId: "pay_test1",
+      signature: sig("order_other", "pay_test1"),
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("INVALID_SIGNATURE");
+    expect((await gateway.get("paymentRecords", "order_test1"))?.paymentStatus).toBe("INITIATED");
+  });
+
+  it("payment belonging to another order is rejected without state change", async () => {
+    await createInit("idem-sec-ordermm");
+    razorpay.paymentEntity = { ...razorpay.paymentEntity, order_id: "order_other" };
+    const res = await verifyOk();
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("ORDER_MISMATCH");
+    expect((await gateway.get("paymentRecords", "order_test1"))?.paymentStatus).toBe("INITIATED");
+  });
+
+  it("amount mismatch is rejected without state change", async () => {
+    await createInit("idem-sec-amtmm");
+    razorpay.paymentEntity = { ...razorpay.paymentEntity, amount: 99999 };
+    const res = await verifyOk();
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("AMOUNT_MISMATCH");
+    expect((await gateway.get("paymentRecords", "order_test1"))?.paymentStatus).toBe("INITIATED");
+  });
+
+  it("currency mismatch is rejected without state change", async () => {
+    await createInit("idem-sec-curmm");
+    razorpay.paymentEntity = { ...razorpay.paymentEntity, currency: "USD" };
+    const res = await verifyOk();
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("CURRENCY_MISMATCH");
+    expect((await gateway.get("paymentRecords", "order_test1"))?.paymentStatus).toBe("INITIATED");
+  });
+
+  it("uncaptured payment is rejected without state change", async () => {
+    await createInit("idem-sec-nocap");
+    razorpay.paymentEntity = { ...razorpay.paymentEntity, status: "authorized" };
+    const res = await verifyOk();
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("NOT_CAPTURED");
+    expect((await gateway.get("paymentRecords", "order_test1"))?.paymentStatus).toBe("INITIATED");
+  });
+
+  it("payment missing at Razorpay returns PAYMENT_NOT_FOUND", async () => {
+    await createInit("idem-sec-nopay");
+    razorpay.paymentEntity = null;
+    const res = await verifyOk();
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe("PAYMENT_NOT_FOUND");
+  });
+
+  it("purpose and customer stay server-side after verification", async () => {
+    await createInit("idem-sec-purpose");
+    const res = await verifyOk();
+    expect(res.status).toBe(200);
+    const rec = await gateway.get("paymentRecords", "order_test1");
+    expect(rec?.purpose).toBe("DONATION");
+    expect((rec?.customer as Record<string, unknown>)?.email).toBe("jane@example.com");
+  });
+
+  it("concurrent verification of one capture yields a single transition", async () => {
+    await createInit("idem-sec-concverify");
+    const results = await Promise.all(Array.from({ length: 5 }, () => verifyOk()));
+    for (const r of results) {
+      expect(r.status).toBe(200);
+      expect(r.body.status).toBe("PAID");
+    }
+    const rec = await gateway.get("paymentRecords", "order_test1");
+    expect(rec?.paymentStatus).toBe("PAID");
+    const attempts = (rec?.attempts ?? []) as Array<Record<string, unknown>>;
+    expect(attempts.filter((a) => a.event === "CAPTURED_VERIFIED")).toHaveLength(1);
+  });
+
+  it("webhook payment.failed moves an open order to FAILED", async () => {
+    await createInit("idem-sec-failed");
+    const raw = JSON.stringify({
+      event: "payment.failed",
+      payload: { payment: { entity: { id: "pay_test1", order_id: "order_test1", error_description: "insufficient funds" } } },
+    });
+    const res = await request(app)
+      .post("/api/payments/webhook")
+      .set("Content-Type", "application/json")
+      .set("x-razorpay-signature", webhookSig(raw))
+      .send(raw);
+    expect(res.status).toBe(200);
+    expect((await gateway.get("paymentRecords", "order_test1"))?.paymentStatus).toBe("FAILED");
+  });
+
+  it("webhook order.paid marks the order PAID", async () => {
+    await createInit("idem-sec-orderpaid");
+    const raw = JSON.stringify({
+      event: "order.paid",
+      payload: { order: { entity: { id: "order_test1", amount_paid: 50000 } } },
+    });
+    const res = await request(app)
+      .post("/api/payments/webhook")
+      .set("Content-Type", "application/json")
+      .set("x-razorpay-signature", webhookSig(raw))
+      .send(raw);
+    expect(res.status).toBe(200);
+    expect((await gateway.get("paymentRecords", "order_test1"))?.paymentStatus).toBe("PAID");
+  });
+
+  it("webhook refund.processed finalizes a refund", async () => {
+    await gateway.set("users", "admin-1", { status: "active", role: "ADMIN" });
+    await createInit("idem-sec-refhook");
+    await verifyOk();
+    await request(app).post("/api/payments/refund").send({ recordId: "order_test1", idToken: "admin-token" });
+    const raw = JSON.stringify({
+      event: "refund.processed",
+      payload: { refund: { entity: { id: "rfnd_test1", payment_id: "pay_test1", status: "processed", amount: 50000 } } },
+    });
+    const res = await request(app)
+      .post("/api/payments/webhook")
+      .set("Content-Type", "application/json")
+      .set("x-razorpay-signature", webhookSig(raw))
+      .send(raw);
+    expect(res.status).toBe(200);
+    expect((await gateway.get("paymentRecords", "order_test1"))?.paymentStatus).toBe("REFUNDED");
+  });
+
+  it("webhook-first then verify converges on one stable PAID", async () => {
+    await createInit("idem-sec-race1");
+    const raw = JSON.stringify({
+      event: "payment.captured",
+      payload: { payment: { entity: { id: "pay_test1", order_id: "order_test1", amount: 50000, currency: "INR", status: "captured" } } },
+    });
+    const hook = await request(app)
+      .post("/api/payments/webhook")
+      .set("Content-Type", "application/json")
+      .set("x-razorpay-signature", webhookSig(raw))
+      .send(raw);
+    expect(hook.status).toBe(200);
+    const res = await verifyOk();
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("PAID");
+    const rec = await gateway.get("paymentRecords", "order_test1");
+    expect(rec?.paymentStatus).toBe("PAID");
+    expect(res.body.payment_completed_at).toBe(rec?.paymentCompletedAt);
+  });
+
+  it("verify-first then a stale failed webhook never downgrades PAID", async () => {
+    await createInit("idem-sec-race2");
+    const res = await verifyOk();
+    expect(res.status).toBe(200);
+    const raw = JSON.stringify({
+      event: "payment.failed",
+      payload: { payment: { entity: { id: "pay_test1", order_id: "order_test1", error_description: "late failure" } } },
+    });
+    const hook = await request(app)
+      .post("/api/payments/webhook")
+      .set("Content-Type", "application/json")
+      .set("x-razorpay-signature", webhookSig(raw))
+      .send(raw);
+    expect(hook.status).toBe(200);
+    expect((await gateway.get("paymentRecords", "order_test1"))?.paymentStatus).toBe("PAID");
+  });
+
+  it("duplicate refund is rejected and calls Razorpay once", async () => {
+    await gateway.set("users", "admin-1", { status: "active", role: "ADMIN" });
+    await createInit("idem-sec-duprefund");
+    await verifyOk();
+    const first = await request(app).post("/api/payments/refund").send({ recordId: "order_test1", idToken: "admin-token" });
+    expect(first.status).toBe(200);
+    const second = await request(app).post("/api/payments/refund").send({ recordId: "order_test1", idToken: "admin-token" });
+    expect(second.status).toBe(409);
+    expect(second.body.code).toBe("NOT_PAID");
+    expect(razorpay.refunds).toHaveLength(1);
+    expect((await gateway.get("paymentRecords", "order_test1"))?.paymentStatus).toBe("REFUNDED");
+  });
+
+  it("refund of an unpaid or missing record is rejected", async () => {
+    await gateway.set("users", "admin-1", { status: "active", role: "ADMIN" });
+    await createInit("idem-sec-refunpaid");
+    const unpaid = await request(app).post("/api/payments/refund").send({ recordId: "order_test1", idToken: "admin-token" });
+    expect(unpaid.status).toBe(409);
+    expect(unpaid.body.code).toBe("NOT_PAID");
+    const missing = await request(app).post("/api/payments/refund").send({ recordId: "order_nope", idToken: "admin-token" });
+    expect(missing.status).toBe(404);
+    expect(razorpay.refunds).toHaveLength(0);
+  });
+
+  it("re-verification after refund stays terminal without state change", async () => {
+    await gateway.set("users", "admin-1", { status: "active", role: "ADMIN" });
+    await createInit("idem-sec-reverify");
+    await verifyOk();
+    await request(app).post("/api/payments/refund").send({ recordId: "order_test1", idToken: "admin-token" });
+    const res = await verifyOk();
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("ALREADY_COMPLETED");
+    expect((await gateway.get("paymentRecords", "order_test1"))?.paymentStatus).toBe("REFUNDED");
+  });
+
+  it("client-sent payment state is ignored on order creation", async () => {
+    const res = await request(app).post("/api/payments/orders").send(
+      orderBody({
+        idempotencyKey: "idem-sec-clientstate",
+        paymentStatus: "PAID",
+        paymentId: "pay_forged",
+        status: "REFUNDED",
+      } as Record<string, unknown>),
+    );
+    expect(res.status).toBe(200);
+    const rec = await gateway.get("paymentRecords", "order_test1");
+    expect(rec?.paymentStatus).toBe("INITIATED");
+    expect(rec?.paymentId).toBeNull();
+  });
+
+  it("webhook with an unknown event is acknowledged without side effects", async () => {
+    const raw = JSON.stringify({ event: "subscription.activated", payload: {} });
+    const res = await request(app)
+      .post("/api/payments/webhook")
+      .set("Content-Type", "application/json")
+      .set("x-razorpay-signature", webhookSig(raw))
+      .send(raw);
+    expect(res.status).toBe(200);
+    expect(gateway.count("paymentRecords")).toBe(0);
+  });
+
+  it("rejects zero, negative, excessive, over-precise, and non-numeric amounts", async () => {
+    for (const amount of [0, -50, 1000001, 10.123, "abc", "", null]) {
+      const res = await request(app)
+        .post("/api/payments/orders")
+        .send(orderBody({ idempotencyKey: `idem-sec-amt-${String(amount)}`, amount: amount as number }));
+      expect(res.status).toBe(400);
+    }
+    expect(gateway.count("paymentRecords")).toBe(0);
+    expect(razorpay.orders).toHaveLength(0);
+  });
+
+  it("rejects missing idempotency key, missing token, and non-INR currency", async () => {
+    const noKey = await request(app).post("/api/payments/orders").send(orderBody({ idempotencyKey: "" }));
+    expect(noKey.status).toBe(400);
+    expect(noKey.body.code).toBe("MISSING_IDEMPOTENCY");
+    const noToken = await request(app)
+      .post("/api/payments/orders")
+      .send(orderBody({ idempotencyKey: "idem-sec-notoken", antiSpamToken: "  " }));
+    expect(noToken.status).toBe(400);
+    const usd = await request(app)
+      .post("/api/payments/orders")
+      .send(orderBody({ idempotencyKey: "idem-sec-usd", currency: "USD" }));
+    expect(usd.status).toBe(400);
+    expect(gateway.count("paymentRecords")).toBe(0);
+  });
+});
+
+describe("payment primitives", () => {
+  it("toPaise converts cleanly and rejects garbage", async () => {
+    const { toPaise, canTransition } = await import("../src/services/payments.js");
+    expect(toPaise(100)).toBe(10000);
+    expect(toPaise("250.5")).toBe(25050);
+    expect(toPaise("249.99")).toBe(24999);
+    expect(toPaise(0)).toBeNull();
+    expect(toPaise(-50)).toBeNull();
+    expect(toPaise(Number.NaN)).toBeNull();
+    expect(toPaise(Number.POSITIVE_INFINITY)).toBeNull();
+    expect(toPaise("abc")).toBeNull();
+    expect(toPaise("")).toBeNull();
+    expect(toPaise(10.123)).toBeNull();
+    expect(toPaise(null)).toBeNull();
+    expect(toPaise(undefined)).toBeNull();
+  });
+
+  it("state machine allows only the documented transitions", async () => {
+    const { canTransition } = await import("../src/services/payments.js");
+    expect(canTransition("INITIATED", "PAID")).toBe(true);
+    expect(canTransition("INITIATED", "FAILED")).toBe(true);
+    expect(canTransition("INITIATED", "REFUNDED")).toBe(true);
+    expect(canTransition("PAID", "REFUNDED")).toBe(true);
+    expect(canTransition("FAILED", "PAID")).toBe(true);
+    expect(canTransition("REFUNDED", "PAID")).toBe(false);
+    expect(canTransition("REFUNDED", "INITIATED")).toBe(false);
+    expect(canTransition("PAID", "INITIATED")).toBe(false);
+    expect(canTransition("INITIATED", "INITIATED")).toBe(false);
+    expect(canTransition("UNKNOWN", "PAID")).toBe(false);
   });
 });
