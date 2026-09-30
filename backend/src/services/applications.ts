@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { FirestoreGateway } from "./firestore.js";
+import { isAlreadyExists } from "./firestore.js";
 import { issueCapability } from "./capabilities.js";
 
 export const APPLICATIONS_COLLECTION = "sponsorshipRequests";
@@ -101,10 +103,23 @@ export type SubmitOutcome =
   | { ok: false; status: number; code: string; message: string };
 
 /**
+ * Deterministic application ID derived from the idempotency nonce. The ID
+ * space is content-addressed, so an atomic single-document create decides
+ * the race: exactly one simultaneous submission wins, the rest observe the
+ * existing record. Raw nonces never become document IDs (fixed safe shape).
+ */
+export function applicationIdFor(formNonce: string): string {
+  return `app_${createHash("sha256").update(formNonce, "utf8").digest("hex").slice(0, 40)}`;
+}
+
+/**
  * Idempotent application intake. The browser-provided formNonce is an
- * idempotency key only — never authorization. A retry with the same nonce
- * returns the existing application plus fresh capabilities for documents
- * that are not uploaded yet; it never creates a second record.
+ * idempotency key only — never authorization. Creation is a single atomic
+ * createWithId on the deterministic ID (no check-then-write): N concurrent
+ * submissions with one nonce yield EXACTLY ONE application. A retry with the
+ * same nonce returns the existing application (merging any newly submitted
+ * metadata rows transactionally) plus fresh capabilities for documents that
+ * are not uploaded yet; it never creates a second record.
  */
 export async function submitApplication(
   gateway: FirestoreGateway,
@@ -140,27 +155,7 @@ export async function submitApplication(
     };
   }
 
-  const existing = await gateway.queryEqual(APPLICATIONS_COLLECTION, "formNonce", input.formNonce, 1);
-  if (existing.length > 0) {
-    const found = existing[0] as { id: string; data: Record<string, unknown> };
-    const stored = Array.isArray(found.data.documents)
-      ? (found.data.documents as Array<Record<string, unknown>>)
-      : [];
-    const byId = new Map(stored.map((e) => [String(e.id ?? ""), e]));
-    let changed = false;
-    for (const entry of input.documents) {
-      if (!byId.has(entry.id)) {
-        byId.set(entry.id, recordedEntry(entry));
-        changed = true;
-      }
-    }
-    const merged = [...byId.values()];
-    if (changed) {
-      await gateway.update(APPLICATIONS_COLLECTION, found.id, { documents: merged, updatedAt: nowIso() });
-    }
-    return { ok: true, result: { applicationId: found.id, uploads: await offersFor(gateway, found.id, merged) } };
-  }
-
+  const applicationId = applicationIdFor(input.formNonce);
   const docs = input.documents.map(recordedEntry);
   const record: Record<string, unknown> = {
     ...(input.application as Record<string, unknown>),
@@ -173,6 +168,52 @@ export async function submitApplication(
     createdAt: nowIso(),
     updatedAt: nowIso(),
   };
-  const applicationId = await gateway.create(APPLICATIONS_COLLECTION, record);
+  try {
+    await gateway.createWithId(APPLICATIONS_COLLECTION, applicationId, record);
+  } catch (err) {
+    if (!isAlreadyExists(err)) throw err;
+    return submitExisting(gateway, applicationId, input.documents);
+  }
   return { ok: true, result: { applicationId, uploads: await offersFor(gateway, applicationId, docs) } };
+}
+
+/**
+ * Retry path for an already-created application: merge any newly submitted
+ * metadata rows (transactionally, so concurrent uploads cannot lose data)
+ * and issue fresh capabilities for documents that are not ready yet.
+ */
+async function submitExisting(
+  gateway: FirestoreGateway,
+  applicationId: string,
+  entries: SubmissionInput["documents"],
+): Promise<SubmitOutcome> {
+  const merged = await gateway.runTransaction(async (tx) => {
+    const found = await tx.get(APPLICATIONS_COLLECTION, applicationId);
+    if (!found) return null;
+    const stored = Array.isArray(found.documents)
+      ? (found.documents as Array<Record<string, unknown>>)
+      : [];
+    const byId = new Map(stored.map((e) => [String(e.id ?? ""), e]));
+    let changed = false;
+    for (const entry of entries) {
+      const record = recordedEntry(entry);
+      if (!byId.has(String(record.id))) {
+        byId.set(String(record.id), record);
+        changed = true;
+      }
+    }
+    const next = [...byId.values()];
+    if (changed) {
+      await tx.update(APPLICATIONS_COLLECTION, applicationId, { documents: next, updatedAt: nowIso() });
+    }
+    return next;
+  });
+  if (!merged) {
+    // Won the race signal but the record vanished (deleted between calls):
+    // a single bounded retry recreates it instead of failing the user.
+    const retry = await gateway.get(APPLICATIONS_COLLECTION, applicationId).catch(() => null);
+    if (retry) return submitExisting(gateway, applicationId, entries);
+    return { ok: false, status: 409, code: "STATE_CONFLICT", message: "This submission is already in progress. Please try again." };
+  }
+  return { ok: true, result: { applicationId, uploads: await offersFor(gateway, applicationId, merged) } };
 }

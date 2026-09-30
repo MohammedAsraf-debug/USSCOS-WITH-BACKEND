@@ -1,8 +1,8 @@
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import type { FirestoreGateway } from "./firestore.js";
-import { consumeCapability, peekCapability } from "./capabilities.js";
+import { claimCapability, consumeCapability, releaseCapability } from "./capabilities.js";
 import { APPLICATIONS_COLLECTION } from "./applications.js";
 
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -63,9 +63,13 @@ export type UploadOutcome =
   | { ok: false; status: number; code: string; message: string };
 
 /**
- * Capability-gated private upload. Stores bytes under a random filename with
- * mode 0600, PATCHes the application's document metadata, then consumes the
- * capability (single-use). Failed attempts leave the capability valid for retry.
+ * Capability-gated private upload with atomic guarantees:
+ * - the capability lease is claimed transactionally, so concurrent uploads
+ *   with the same token cannot both succeed (exactly one wins);
+ * - the metadata PATCH runs inside a transaction, so concurrent uploads of
+ *   DIFFERENT documents never overwrite each other;
+ * - a failed attempt releases its lease (same token stays retryable) and
+ *   removes any partially written file; only success consumes the capability.
  */
 export async function uploadDocument(
   gateway: FirestoreGateway,
@@ -75,23 +79,26 @@ export async function uploadDocument(
   if (!input.capability || !input.applicationId || !input.documentId) {
     return { ok: false, status: 400, code: "invalid-document", message: "The application upload capability is missing." };
   }
-  const cap = await peekCapability(gateway, input.capability, input.applicationId, input.documentId);
-  if (!cap.ok) {
-    const expired = cap.code === "EXPIRED_CAPABILITY";
-    return { ok: false, status: expired ? 410 : 403, code: cap.code, message: cap.message };
-  }
   const checked = checkFile(input.fileName, input.buffer);
   if (!checked.ok) {
     const tooLarge = checked.message.includes("too large");
     return { ok: false, status: tooLarge ? 413 : 400, code: tooLarge ? "FILE_TOO_LARGE" : "invalid-file", message: checked.message };
   }
+  const owner = randomBytes(16).toString("hex");
+  const claim = await claimCapability(gateway, input.capability, input.applicationId, input.documentId, owner);
+  if (!claim.ok) {
+    const expired = claim.code === "EXPIRED_CAPABILITY";
+    return { ok: false, status: expired ? 410 : 403, code: claim.code, message: claim.message };
+  }
+  const release = () => releaseCapability(gateway, input.capability, owner);
   const record = await gateway.get(APPLICATIONS_COLLECTION, input.applicationId).catch(() => null);
   if (!record) {
+    await release();
     return { ok: false, status: 404, code: "NOT_FOUND", message: "Application not found." };
   }
   const docs = Array.isArray(record.documents) ? (record.documents as Array<Record<string, unknown>>) : [];
-  const idx = docs.findIndex((d) => String(d.id ?? "") === input.documentId);
-  if (idx < 0) {
+  if (!docs.some((d) => String(d.id ?? "") === input.documentId)) {
+    await release();
     return { ok: false, status: 400, code: "invalid-document", message: "Unknown document for this application." };
   }
   const storageRef = randomStorageRef(checked.ext);
@@ -103,25 +110,36 @@ export async function uploadDocument(
   } catch {
     /* best effort on non-POSIX filesystems */
   }
-  const entry = {
-    ...docs[idx],
-    storageRef,
-    status: "ready",
-    uploadedAt: new Date().toISOString(),
-    fileName: input.fileName,
-    fileSizeBytes: input.buffer.length,
-    fileType: checked.mime,
-    fileUrl: null,
-  };
-  const next = docs.slice();
-  next[idx] = entry;
+  const stamped = new Date().toISOString();
   try {
-    await gateway.update(APPLICATIONS_COLLECTION, input.applicationId, {
-      documents: next,
-      updatedAt: new Date().toISOString(),
+    await gateway.runTransaction(async (tx) => {
+      const current = await tx.get(APPLICATIONS_COLLECTION, input.applicationId);
+      if (!current) throw new Error("application-gone");
+      const currentDocs = Array.isArray(current.documents)
+        ? (current.documents as Array<Record<string, unknown>>)
+        : [];
+      const next = currentDocs.map((d) =>
+        String(d.id ?? "") === input.documentId
+          ? {
+              ...d,
+              storageRef,
+              status: "ready",
+              uploadedAt: stamped,
+              fileName: input.fileName,
+              fileSizeBytes: input.buffer.length,
+              fileType: checked.mime,
+              fileUrl: null,
+            }
+          : d,
+      );
+      await tx.update(APPLICATIONS_COLLECTION, input.applicationId, {
+        documents: next,
+        updatedAt: stamped,
+      });
     });
   } catch {
-    await import("node:fs/promises").then((fs) => fs.unlink(target).catch(() => undefined));
+    await unlink(target).catch(() => undefined);
+    await release();
     return { ok: false, status: 500, code: "SERVER_ERROR", message: "Upload failed. Please try again." };
   }
   await consumeCapability(gateway, input.capability);

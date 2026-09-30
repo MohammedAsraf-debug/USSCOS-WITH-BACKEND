@@ -86,4 +86,33 @@ describe("POST /api/applications", () => {
     expect(res.status).toBe(400);
     expect(res.body.code).toBe("invalid-document");
   });
+
+  it("10 simultaneous submissions with one nonce create exactly one application", async () => {
+    const payload = athleteSubmission("nonce-concurrent-0001");
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        request(app).post("/api/applications").send(payload).then((r) => ({ status: r.status, body: r.body })),
+      ),
+    );
+    for (const r of results) {
+      expect(r.status).toBe(200);
+      expect(r.body.ok).toBe(true);
+    }
+    const ids = new Set(results.map((r) => String(r.body.applicationId)));
+    expect(ids.size).toBe(1);
+    expect(gateway.count(APPLICATIONS_COLLECTION)).toBe(1);
+    // Every caller receives a usable capability set for the same application.
+    for (const r of results) {
+      expect(r.body.uploads).toHaveLength(4);
+    }
+  });
+
+  it("different nonces create separate applications", async () => {
+    const first = await request(app).post("/api/applications").send(athleteSubmission("nonce-separate-0001"));
+    const second = await request(app).post("/api/applications").send(athleteSubmission("nonce-separate-0002"));
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(first.body.applicationId).not.toBe(second.body.applicationId);
+    expect(gateway.count(APPLICATIONS_COLLECTION)).toBe(2);
+  });
 });

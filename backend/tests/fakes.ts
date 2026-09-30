@@ -1,7 +1,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { FirestoreGateway } from "../src/services/firestore.js";
+import type { FirestoreGateway, TxGateway } from "../src/services/firestore.js";
 import type { TokenVerifier } from "../src/services/auth.js";
 import type { RazorpayGateway } from "../src/services/razorpay.js";
 import type { BackendConfig } from "../src/config/env.js";
@@ -64,6 +64,48 @@ export class MemoryFirestoreGateway implements FirestoreGateway {
   async remove(collection: string, id: string): Promise<void> {
     this.col(collection).delete(id);
   }
+
+  /**
+   * Atomic single-document create: the existence check and the write happen
+   * synchronously with no await between them, so concurrent interleavings in
+   * this process cannot both succeed (mirrors the server-side guarantee).
+   */
+  async createWithId(collection: string, id: string, data: Record<string, unknown>): Promise<void> {
+    const c = this.col(collection);
+    if (c.has(id)) {
+      throw Object.assign(new Error("already exists"), { code: 6 });
+    }
+    c.set(id, { ...data });
+  }
+
+  /**
+   * Serialized transactions: each fn runs exclusively, so read-modify-write
+   * sequences are atomic within this process (mirrors Firestore semantics
+   * closely enough for concurrency regression tests).
+   */
+  private txTail: Promise<unknown> = Promise.resolve();
+
+  async runTransaction<T>(fn: (tx: TxGateway) => Promise<T>): Promise<T> {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const previous = this.txTail;
+    this.txTail = gate;
+    await previous;
+    try {
+      const tx: TxGateway = {
+        get: (collection, id) => this.get(collection, id),
+        set: (collection, id, data) => this.set(collection, id, data),
+        update: (collection, id, patch) => this.update(collection, id, patch),
+        remove: (collection, id) => this.remove(collection, id),
+        create: (collection, id, data) => this.createWithId(collection, id, data),
+      };
+      return await fn(tx);
+    } finally {
+      release();
+    }
+  }
 }
 
 /** Token verifier fake: token string -> uid, anything else throws. */
@@ -90,6 +132,8 @@ export class FakeRazorpay implements RazorpayGateway {
   public refundEntity: Record<string, unknown> = { id: "rfnd_test1", status: "processed", amount: 50000 };
   public failCreateOrder = false;
   public failCreateOrderWith: { status: number; code: string; description: string } | null = null;
+  /** When set, order IDs are drawn from this queue (for multi-order tests). */
+  public orderIdSequence: string[] = [];
 
   async createOrder(input: { amountPaise: number; currency: string; receipt: string; notes: Record<string, string> }): Promise<{ id: string }> {
     if (this.failCreateOrderWith) {
@@ -102,7 +146,7 @@ export class FakeRazorpay implements RazorpayGateway {
     }
     if (this.failCreateOrder) throw new Error("gateway down");
     this.orders.push({ ...input });
-    return { id: "order_test1" };
+    return { id: this.orderIdSequence.length > 0 ? (this.orderIdSequence.shift() as string) : "order_test1" };
   }
 
   async fetchPayment(_paymentId: string): Promise<Record<string, unknown> | null> {

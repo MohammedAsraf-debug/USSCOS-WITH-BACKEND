@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { FirestoreGateway } from "./firestore.js";
+import { isAlreadyExists } from "./firestore.js";
 import type { TokenVerifier } from "./auth.js";
 import { requireStaff } from "./auth.js";
 import {
@@ -222,24 +223,77 @@ export async function createOrderFlow(deps: PaymentServiceDeps, body: Record<str
     const human = await verifyTurnstile(deps.turnstileSecret, input.antiSpamToken);
     if (!human) return err(429, "ANTI_SPAM_FAILED", "Anti-spam verification failed");
   }
-  const existing = await deps.gateway.queryEqual(PAYMENT_COLLECTION, "idempotencyKey", input.idempotencyKey, 50);
-  let initiated: { id: string; data: Record<string, unknown> } | null = null;
-  for (const rec of existing) {
-    const status = String(rec.data.paymentStatus ?? "INITIATED");
-    if (status === "PAID" || status === "REFUNDED") {
-      return err(409, "ALREADY_COMPLETED", "This payment is already completed");
+  return claimReservation(deps, input, 0);
+}
+export const RESERVATIONS_COLLECTION = "paymentIdempotency";
+/** Stale-claim horizon: a reservation without an order older than this may be reclaimed. */
+export const RESERVATION_TTL_MS = 5 * 60 * 1000;
+/** How long concurrent losers wait for the winner's order before giving up. */
+export const RESERVATION_POLL_MS = 8000;
+const RESERVATION_POLL_STEP_MS = 100;
+
+/** Deterministic reservation ID: content-addressed, always ID-safe. */
+export function reservationIdFor(idempotencyKey: string): string {
+  return `idem_${createHash("sha256").update(idempotencyKey, "utf8").digest("hex").slice(0, 32)}`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function reservationFresh(createdAt: unknown): boolean {
+  return typeof createdAt === "string" && Date.parse(createdAt) + RESERVATION_TTL_MS >= Date.now();
+}
+
+/**
+ * Atomic claim step for one idempotency key. A single atomic createWithId on
+ * the deterministic reservation ID decides the race (no check-then-write):
+ * exactly one simultaneous request wins and creates the Razorpay order;
+ * losers observe the winner's order (polling briefly while it is in
+ * flight) and resolve to the same record. Stale ownerless reservations
+ * (crashed creator) are reclaimed once past the TTL.
+ */
+async function claimReservation(
+  deps: PaymentServiceDeps,
+  input: NormalizedOrder,
+  attempt: number,
+): Promise<ServiceOutcome> {
+  const rid = reservationIdFor(input.idempotencyKey);
+  const stamped = nowIso();
+  try {
+    await deps.gateway.createWithId(RESERVATIONS_COLLECTION, rid, {
+      idempotencyKey: input.idempotencyKey,
+      orderId: null,
+      previousOrderIds: [],
+      owner: createHash("sha256").update(`${input.idempotencyKey}|${stamped}|${Math.random()}`, "utf8").digest("hex"),
+      createdAt: stamped,
+      updatedAt: stamped,
+    });
+  } catch (cause) {
+    if (!isAlreadyExists(cause)) throw cause;
+    const existing = await deps.gateway.get(RESERVATIONS_COLLECTION, rid).catch(() => null);
+    const orderId = existing && typeof existing.orderId === "string" ? existing.orderId : "";
+    if (orderId) return followExistingOrder(deps, input, orderId);
+    if (existing && reservationFresh(existing.createdAt)) {
+      const settled = await pollForOrder(deps, rid);
+      if (settled) return followExistingOrder(deps, input, settled);
+      return err(409, "STATE_CONFLICT", "A payment with this key is already in progress. Please wait a moment and try again.");
     }
-    if (status === "INITIATED" && !initiated) initiated = rec;
+    // Stale or vanished reservation: remove best-effort and reclaim once.
+    await deps.gateway.remove(RESERVATIONS_COLLECTION, rid).catch(() => undefined);
+    if (attempt < 1) return claimReservation(deps, input, attempt + 1);
+    return err(409, "STATE_CONFLICT", "A payment with this key is already in progress. Please wait a moment and try again.");
   }
-  if (initiated) {
-    const recId = String(initiated.data.orderId ?? "");
-    if (recId) {
-      return {
-        status: 200,
-        body: orderPayload(deps.keyId, recId, input.amountPaise, Number(initiated.data.amountPaise ?? 0)),
-      };
-    }
-  }
+  return createNewOrder(deps, input, rid, []);
+}
+
+/** Winner path: create the Razorpay order + record, then publish the orderId. */
+async function createNewOrder(
+  deps: PaymentServiceDeps,
+  input: NormalizedOrder,
+  rid: string,
+  previousOrderIds: string[],
+): Promise<ServiceOutcome> {
   const receipt = `uss_${createHash("sha256").update(`${input.idempotencyKey}|${nowIso()}`, "utf8").digest("hex").slice(0, 32)}`;
   let orderId = "";
   try {
@@ -250,9 +304,14 @@ export async function createOrderFlow(deps: PaymentServiceDeps, body: Record<str
       notes: { purpose: input.purpose, idempotencyKey: input.idempotencyKey },
     }));
   } catch (err) {
+    await deps.gateway.remove(RESERVATIONS_COLLECTION, rid).catch(() => undefined);
     return gatewayFailure(deps.debug, "Razorpay order creation failed", err);
   }
-  if (!orderId) return err(502, "GATEWAY_ERROR", "Razorpay returned no order id");
+  if (!orderId) {
+    await deps.gateway.remove(RESERVATIONS_COLLECTION, rid).catch(() => undefined);
+    return err(502, "GATEWAY_ERROR", "Razorpay returned no order id");
+  }
+  const stamped = nowIso();
   const doc = {
     purpose: input.purpose,
     paymentStatus: "INITIATED",
@@ -266,25 +325,22 @@ export async function createOrderFlow(deps: PaymentServiceDeps, body: Record<str
     customer: input.customer,
     entity: input.entity,
     payload: input.payload,
-    attempts: [{ event: "ORDER_CREATED", eventId: orderId, at: nowIso(), note: "" }],
+    attempts: [{ event: "ORDER_CREATED", eventId: orderId, at: stamped, note: "" }],
     refund: null,
     paymentId: null,
     paymentCompletedAt: null,
-    createdAt: nowIso(),
-    updatedAt: nowIso(),
+    createdAt: stamped,
+    updatedAt: stamped,
   };
   try {
     await deps.gateway.set(PAYMENT_COLLECTION, orderId, doc);
   } catch {
-    const rec = await deps.gateway.get(PAYMENT_COLLECTION, orderId).catch(() => null);
-    if (rec) {
-      return {
-        status: 200,
-        body: orderPayload(deps.keyId, orderId, input.amountPaise, Number(rec.amountPaise ?? 0)),
-      };
-    }
+    await deps.gateway.remove(RESERVATIONS_COLLECTION, rid).catch(() => undefined);
     throw new Error("payment record write failed");
   }
+  await deps.gateway
+    .update(RESERVATIONS_COLLECTION, rid, { orderId, previousOrderIds, updatedAt: nowIso() })
+    .catch(() => undefined);
   return {
     status: 200,
     body: {
@@ -297,6 +353,53 @@ export async function createOrderFlow(deps: PaymentServiceDeps, body: Record<str
       purpose: input.purpose,
     },
   };
+}
+
+/**
+ * Existing-order path: completed keys are terminal, INITIATED keys reuse the
+ * open order (with the amount-mismatch flag), FAILED keys roll forward to a
+ * fresh Razorpay order while the reservation tracks history. A missing
+ * record (deleted out-of-band) safely restarts the creation flow.
+ */
+async function followExistingOrder(
+  deps: PaymentServiceDeps,
+  input: NormalizedOrder,
+  orderId: string,
+): Promise<ServiceOutcome> {
+  const rec = await deps.gateway.get(PAYMENT_COLLECTION, orderId).catch(() => null);
+  if (!rec) {
+    const rid = reservationIdFor(input.idempotencyKey);
+    return createNewOrder(deps, input, rid, []);
+  }
+  const status = String(rec.paymentStatus ?? "INITIATED");
+  if (status === "PAID" || status === "REFUNDED") {
+    return err(409, "ALREADY_COMPLETED", "This payment is already completed");
+  }
+  if (status === "INITIATED") {
+    return {
+      status: 200,
+      body: orderPayload(deps.keyId, orderId, input.amountPaise, Number(rec.amountPaise ?? 0)),
+    };
+  }
+  const rid = reservationIdFor(input.idempotencyKey);
+  const prior = await deps.gateway.get(RESERVATIONS_COLLECTION, rid).catch(() => null);
+  const previousOrderIds =
+    prior && Array.isArray(prior.previousOrderIds)
+      ? [...(prior.previousOrderIds as string[]), orderId]
+      : [orderId];
+  return createNewOrder(deps, input, rid, previousOrderIds);
+}
+
+/** Wait (bounded) for a concurrent winner to publish its orderId. */
+async function pollForOrder(deps: PaymentServiceDeps, rid: string): Promise<string> {
+  const deadline = Date.now() + RESERVATION_POLL_MS;
+  for (;;) {
+    const current = await deps.gateway.get(RESERVATIONS_COLLECTION, rid).catch(() => null);
+    const orderId = current && typeof current.orderId === "string" ? current.orderId : "";
+    if (orderId) return orderId;
+    if (Date.now() >= deadline) return "";
+    await sleep(RESERVATION_POLL_STEP_MS);
+  }
 }
 
 function successPayload(orderId: string, paymentId: string, completedAt: string): Record<string, unknown> {

@@ -5,8 +5,6 @@ import { documentLimiter } from "../middleware/security.js";
 import type { FirestoreGateway } from "../services/firestore.js";
 import type { TokenVerifier } from "../services/auth.js";
 import { bearerToken, requireStaff } from "../services/auth.js";
-import { issueCapability } from "../services/capabilities.js";
-import { APPLICATIONS_COLLECTION } from "../services/applications.js";
 import { MAX_UPLOAD_BYTES, downloadDocument, uploadDocument } from "../services/documents.js";
 
 const upload = multer({
@@ -30,33 +28,11 @@ export function documentsRouter(deps: DocumentRouteDeps): Router {
   const router = Router();
   const limit = documentLimiter();
 
-  /** Compatibility issuance (the primary flow returns capabilities with the application). */
-  router.post(
-    "/api/documents/upload-token",
-    limit,
-    asyncHandler(async (req, res) => {
-      const body = (req.body ?? {}) as Record<string, unknown>;
-      const applicationId = String(body.applicationId ?? "");
-      const documentId = String(body.documentId ?? "");
-      if (!applicationId || !documentId) {
-        sendError(res, 400, "invalid-document", "applicationId and documentId are required.");
-        return;
-      }
-      const record = await deps.gateway.get(APPLICATIONS_COLLECTION, applicationId).catch(() => null);
-      if (!record) {
-        sendError(res, 404, "NOT_FOUND", "Application not found.");
-        return;
-      }
-      const docs = Array.isArray(record.documents) ? (record.documents as Array<Record<string, unknown>>) : [];
-      if (!docs.some((d) => String(d.id ?? "") === documentId)) {
-        sendError(res, 400, "invalid-document", "Unknown document for this application.");
-        return;
-      }
-      const cap = await issueCapability(deps.gateway, applicationId, documentId);
-      res.status(200).json({ ok: true, token: cap.token });
-    }),
-  );
-
+  /** Capabilities are issued exactly once with the application (POST
+   * /api/applications). There is deliberately NO recovery endpoint: an
+   * anonymous caller knowing only application/document IDs must not be able
+   * to mint fresh upload capabilities. Retries re-POST the application with
+   * the same formNonce (idempotent) to receive fresh capabilities. */
   router.post(
     "/api/documents/upload",
     limit,

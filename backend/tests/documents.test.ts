@@ -176,4 +176,65 @@ describe("private documents", () => {
       .attach("file", big, "big.pdf");
     expect([400, 413]).toContain(res.status);
   });
+
+  it("concurrent uploads with the same capability: at most one succeeds", async () => {
+    const { applicationId, uploads } = await submitAthlete(app, "nonce-doc-race-0001");
+    const target = uploads[0] as { documentId: string; capability: string };
+    const attempt = () =>
+      request(app)
+        .post("/api/documents/upload")
+        .set("Authorization", `Upload ${target.capability}`)
+        .field("applicationId", applicationId)
+        .field("documentId", target.documentId)
+        .attach("file", PDF, "aadhaar.pdf")
+        .then((r) => r.status);
+    const statuses = await Promise.all([attempt(), attempt()]);
+    expect(statuses.sort()).toEqual([201, 403]);
+    // Winner's metadata is intact; the sibling document is untouched.
+    const stored = await gateway.get("sponsorshipRequests", applicationId);
+    const docs = stored?.documents as Array<Record<string, unknown>>;
+    const winner = docs.find((d) => String(d.id) === target.documentId);
+    expect(winner?.status).toBe("ready");
+    expect(typeof winner?.storageRef).toBe("string");
+    expect(docs.filter((d) => d.status === "ready")).toHaveLength(1);
+  });
+
+  it("concurrent uploads of different documents both land without lost updates", async () => {
+    const { applicationId, uploads } = await submitAthlete(app, "nonce-doc-race-0002");
+    const first = uploads[0] as { documentId: string; capability: string };
+    const second = uploads[1] as { documentId: string; capability: string };
+    const [r1, r2] = await Promise.all([
+      request(app)
+        .post("/api/documents/upload")
+        .set("Authorization", `Upload ${first.capability}`)
+        .field("applicationId", applicationId)
+        .field("documentId", first.documentId)
+        .attach("file", PDF, "aadhaar.pdf"),
+      request(app)
+        .post("/api/documents/upload")
+        .set("Authorization", `Upload ${second.capability}`)
+        .field("applicationId", applicationId)
+        .field("documentId", second.documentId)
+        .attach("file", PNG, "cert.png"),
+    ]);
+    expect(r1.status).toBe(201);
+    expect(r2.status).toBe(201);
+    expect(r1.body.storageRef).not.toBe(r2.body.storageRef);
+    const stored = await gateway.get("sponsorshipRequests", applicationId);
+    const docs = stored?.documents as Array<Record<string, unknown>>;
+    const byId = new Map(docs.map((d) => [String(d.id), d]));
+    expect(byId.get(first.documentId)?.status).toBe("ready");
+    expect(byId.get(second.documentId)?.status).toBe("ready");
+    expect(byId.get(first.documentId)?.storageRef).toBe(r1.body.storageRef);
+    expect(byId.get(second.documentId)?.storageRef).toBe(r2.body.storageRef);
+  });
+
+  it("anonymous capability recovery is gone (upload-token returns 404)", async () => {
+    const { applicationId, uploads } = await submitAthlete(app, "nonce-doc-notoken-0001");
+    const target = uploads[0] as { documentId: string };
+    const res = await request(app)
+      .post("/api/documents/upload-token")
+      .send({ applicationId, documentId: target.documentId });
+    expect(res.status).toBe(404);
+  });
 });

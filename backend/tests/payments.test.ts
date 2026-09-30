@@ -68,6 +68,42 @@ describe("payments", () => {
     expect(res.body.order_id).toBe("order_test1");
   });
 
+  it("sequential retry with the same key resolves to the same order without a second Razorpay order", async () => {
+    const first = await request(app).post("/api/payments/orders").send(orderBody({ idempotencyKey: "idem-seq-1" }));
+    const second = await request(app).post("/api/payments/orders").send(orderBody({ idempotencyKey: "idem-seq-1" }));
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(second.body.order_id).toBe(first.body.order_id);
+    expect(razorpay.orders).toHaveLength(1);
+    expect(gateway.count("paymentRecords")).toBe(1);
+  });
+
+  it("10 simultaneous orders with one key create exactly one Razorpay order and record", async () => {
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        request(app).post("/api/payments/orders").send(orderBody({ idempotencyKey: "idem-conc-1" })).then((r) => ({ status: r.status, body: r.body })),
+      ),
+    );
+    for (const r of results) {
+      expect(r.status).toBe(200);
+    }
+    const ids = new Set(results.map((r) => String(r.body.order_id)));
+    expect(ids.size).toBe(1);
+    expect(razorpay.orders).toHaveLength(1);
+    expect(gateway.count("paymentRecords")).toBe(1);
+  });
+
+  it("different idempotency keys create different orders", async () => {
+    razorpay.orderIdSequence = ["order_seq_A", "order_seq_B"];
+    const first = await request(app).post("/api/payments/orders").send(orderBody({ idempotencyKey: "idem-diff-A" }));
+    const second = await request(app).post("/api/payments/orders").send(orderBody({ idempotencyKey: "idem-diff-B" }));
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(first.body.order_id).toBe("order_seq_A");
+    expect(second.body.order_id).toBe("order_seq_B");
+    expect(razorpay.orders).toHaveLength(2);
+  });
+
   it("rejects an invalid amount", async () => {
     const res = await request(app).post("/api/payments/orders").send(orderBody({ amount: -5 }));
     expect(res.status).toBe(400);
