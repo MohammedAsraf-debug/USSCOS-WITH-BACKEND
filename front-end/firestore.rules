@@ -1,0 +1,420 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Shared Helpers ───────────────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isRole(role) {
+      return isSignedIn()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == role
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status == 'active';
+    }
+
+    function isSuperAdmin() {
+      return isRole('SUPER_ADMIN');
+    }
+
+    function isAdmin() {
+      return isRole('ADMIN');
+    }
+
+    function isStaff() {
+      return isSuperAdmin() || isAdmin() || isRole('CONTENT_MANAGER');
+    }
+
+    function isCM() {
+      return isRole('CONTENT_MANAGER');
+    }
+
+    function hasAntiSpamToken() {
+      return request.resource.data.keys().hasAll(['antiSpamToken'])
+        && request.resource.data.antiSpamToken is string
+        && request.resource.data.antiSpamToken.size() > 0;
+    }
+
+    function hasConsent() {
+      return request.resource.data.keys().hasAll(['consentGiven'])
+        && request.resource.data.consentGiven == true;
+    }
+
+    function hasPendingStatus() {
+      return request.resource.data.keys().hasAll(['status'])
+        && request.resource.data.status == 'PENDING';
+    }
+
+    function isPublicFormCreate(allowedFields) {
+      return !isSignedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(allowedFields)
+        && hasAntiSpamToken()
+        && hasConsent()
+        && hasPendingStatus();
+    }
+
+    function noAdminFieldsBlocked(blockedFields) {
+      return !request.resource.data.diff(resource.data).affectedKeys()
+        .hasAny(blockedFields);
+    }
+
+    function noStatusOpen() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(['status'])
+        || request.resource.data.status != 'open';
+    }
+
+    // ── Users ────────────────────────────────────────────────────────
+    match /users/{uid} {
+      // A user can always read their own doc (auth/session bootstrap);
+      // staff can read any user doc. Role checks use `get(users/{me})`,
+      // so self-read here is what breaks the bootstrap circular dependency.
+      allow read: if request.auth.uid == uid || isStaff();
+
+      // Only SUPER_ADMIN can create/update user docs (bootstrap + role management)
+      allow create, update: if isSuperAdmin();
+
+      // Never hard-delete users — disable only
+      allow delete: if false;
+    }
+
+    // ── Audit Logs ───────────────────────────────────────────────────
+    match /auditLogs/{logId} {
+      // SA can read all; ADMIN can read own actions
+      allow read: if isSuperAdmin()
+        || (isAdmin() && resource.data.byUid == request.auth.uid);
+
+      // Append-only: an active staff member may CREATE an immutable audit
+      // record for their own workflow action (M3.3C3 — no Cloud Functions),
+      // but never update or delete an existing entry (immutability).
+      allow create: if isStaff()
+        && request.resource.data.byUid == request.auth.uid;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ── Athletes ─────────────────────────────────────────────────────
+    match /athletes/{id} {
+      // Public can read approved athletes; staff can read all (admin lists)
+      allow read: if resource.data.approvalStatus == 'approved' || isStaff();
+
+      // Staff can create
+      allow create: if isStaff()
+        && request.resource.data.approvalStatus == 'draft';
+
+      // Staff update: SA/ADMIN full access; CM restricted to copy fields
+      allow update: if isStaff() && (
+        isSuperAdmin() || isAdmin()
+        || (isCM()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'fullName', 'sport', 'level', 'record', 'championships', 'medals',
+            'biography', 'achievements', 'competitionHistory',
+            'sponsorshipNeeds', 'sponsorshipPurpose',
+            'profileImageUrl', 'coverImageUrl', 'images', 'socialLinks',
+            'seoTitle', 'seoDescription'
+          ])
+          && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'approvalStatus', 'featured', 'order', 'contactInfo'
+          ])
+        )
+      );
+
+      // SA/ADMIN can delete; CM cannot
+      allow delete: if isStaff() && (isSuperAdmin() || isAdmin());
+    }
+
+    // ── Groups ───────────────────────────────────────────────────────
+    match /groups/{id} {
+      allow read: if resource.data.approvalStatus == 'approved' || isStaff();
+
+      allow create: if isStaff()
+        && request.resource.data.approvalStatus == 'draft';
+
+      allow update: if isStaff() && (
+        isSuperAdmin() || isAdmin()
+        || (isCM()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'groupName', 'groupType', 'sports', 'memberCount', 'location',
+            'description', 'website', 'biography', 'achievements',
+            'competitionHistory', 'sponsorshipNeeds', 'sponsorshipPurpose',
+            'profileImageUrl', 'coverImageUrl', 'images', 'socialLinks',
+            'seoTitle', 'seoDescription'
+          ])
+          && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'approvalStatus', 'featured', 'order', 'contactInfo'
+          ])
+        )
+      );
+
+      allow delete: if isStaff() && (isSuperAdmin() || isAdmin());
+    }
+
+    // ── Opportunities ────────────────────────────────────────────────
+    match /opportunities/{id} {
+      allow read: if resource.data.status == 'open';
+
+      allow create: if isStaff()
+        && request.resource.data.status in ['on_hold', 'closed'];
+
+      allow update: if isStaff() && (
+        isSuperAdmin() || isAdmin()
+        || (isCM()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'title', 'type', 'description', 'needs',
+            'linkedEntityKind', 'linkedEntityId', 'primaryRef',
+            'closesAt', 'seoTitle', 'seoDescription',
+            'status'
+          ])
+          && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'featured', 'order'
+          ])
+          && (request.resource.data.diff(resource.data).affectedKeys().hasAny(['status'])
+            ? request.resource.data.status in ['on_hold', 'closed']
+            : true)
+        )
+      );
+
+      allow delete: if isStaff() && (isSuperAdmin() || isAdmin());
+    }
+
+    // ── Events ───────────────────────────────────────────────────────
+    match /events/{id} {
+      allow read: if resource.data.status in ['upcoming', 'past'] || isStaff();
+
+      allow create: if isStaff();
+
+      allow update: if isStaff() && (
+        isSuperAdmin() || isAdmin()
+        || (isCM()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'title', 'type', 'status', 'date', 'time', 'endTime',
+            'location', 'description', 'coverImageUrl',
+            'registrationUrl', 'registrationNote',
+            'participantIds', 'opportunityId',
+            'seoTitle', 'seoDescription'
+          ])
+          && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'featured', 'order'
+          ])
+        )
+      );
+
+      allow delete: if isStaff() && (isSuperAdmin() || isAdmin());
+    }
+
+    // ── Stories ──────────────────────────────────────────────────────
+    match /stories/{id} {
+      allow read: if resource.data.published == true || isStaff();
+
+      allow create: if isStaff()
+        && request.resource.data.published == false;
+
+      allow update: if isStaff() && (
+        isSuperAdmin() || isAdmin()
+        || isCM()
+      );
+
+      allow delete: if isStaff() && (isSuperAdmin() || isAdmin());
+    }
+
+    // ── Gallery Images ───────────────────────────────────────────────
+    match /galleryImages/{id} {
+      // Always public once uploaded
+      allow read: if true;
+
+      allow create: if isStaff();
+
+      allow update: if isStaff() && (
+        isSuperAdmin() || isAdmin()
+        || (isCM()
+          && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'order'
+          ])
+        )
+      );
+
+      allow delete: if isStaff() && (isSuperAdmin() || isAdmin());
+    }
+
+    // ── Partners ─────────────────────────────────────────────────────
+    match /partners/{id} {
+      allow read: if resource.data.active == true || isStaff();
+
+      allow create: if isStaff()
+        && request.resource.data.active == false;
+
+      allow update: if isStaff() && (
+        isSuperAdmin() || isAdmin()
+        || (isCM()
+          && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'featured', 'order'
+          ])
+        )
+      );
+
+      allow delete: if isStaff() && (isSuperAdmin() || isAdmin());
+    }
+
+    // ── Sport Disciplines ────────────────────────────────────────────
+    match /sportDisciplines/{id} {
+      allow read: if true;
+
+      allow create, update, delete: if isStaff() && (isSuperAdmin() || isAdmin());
+    }
+
+    // ── Needs List ───────────────────────────────────────────────────
+    match /needsList/{id} {
+      allow read: if true;
+
+      allow create, update, delete: if isStaff() && (isSuperAdmin() || isAdmin());
+    }
+
+    // ── Site Settings ────────────────────────────────────────────────
+    match /siteSettings/{key} {
+      allow read: if true;
+
+      // SA full write; ADMIN partial (no legal wording)
+      allow create: if isStaff() && (
+        isSuperAdmin()
+        || (isAdmin() && key != 'privacy' && key != 'terms')
+      );
+
+      allow update: if isStaff() && (
+        isSuperAdmin()
+        || (isAdmin() && key != 'privacy' && key != 'terms')
+      );
+
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── Content Blocks (public website text) ─────────────────────────
+    // Public copy for homepage/about/contact/stats. Public read; any active
+    // staff member (SUPER_ADMIN/ADMIN/CONTENT_MANAGER) may create/update;
+    // delete is SUPER_ADMIN only (prevents accidental removal of live copy).
+    match /contentBlocks/{id} {
+      allow read: if true;
+
+      allow create: if isStaff();
+
+      allow update: if isStaff();
+
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── Sponsorship Requests (athlete/group registration) ────────────
+    match /sponsorshipRequests/{id} {
+      // Admin read only
+      allow read: if isStaff() && (isSuperAdmin() || isAdmin());
+
+      // Public anonymous create with shape rules
+      allow create: if !isSignedIn()
+        && request.resource.data.status == 'PENDING'
+        && request.resource.data.consentGiven == true
+        && request.resource.data.antiSpamToken is string
+        && request.resource.data.antiSpamToken.size() > 0
+        && !request.resource.data.keys().hasAny(['adminNotes', 'reviewHistory', 'processedBy']);
+
+      // SA/ADMIN manage status + admin fields
+      allow update: if isStaff() && (isSuperAdmin() || isAdmin());
+
+      allow delete: if isStaff() && (isSuperAdmin() || isAdmin());
+    }
+
+    // ── Sponsor Applications (single sponsorship/payment record) ──────
+    match /sponsorApplications/{id} {
+      // Staff monitoring read only
+      allow read: if isStaff() && (isSuperAdmin() || isAdmin());
+
+      // Anonymous sponsorship create: payment status starts INITIATED and the
+      // payment belongs to the Razorpay seam. The browser may never set
+      // paymentStatus to PAID nor stamp server-assigned payment fields.
+      allow create: if !isSignedIn()
+        && request.resource.data.status == 'PENDING'
+        && request.resource.data.paymentStatus == 'INITIATED'
+        && request.resource.data.paymentProvider == 'razorpay'
+        && request.resource.data.currency == 'INR'
+        && (request.resource.data.amount is int
+          || request.resource.data.amount is float)
+        && request.resource.data.amount > 0
+        && request.resource.data.consentGiven == true
+        && request.resource.data.antiSpamToken is string
+        && request.resource.data.antiSpamToken.size() > 0
+        && !request.resource.data.keys().hasAny([
+          'adminNotes', 'reviewHistory', 'processedBy',
+          'paymentId', 'orderId', 'paymentCompletedAt'
+        ]);
+
+      // SA/ADMIN manage status + admin fields (payment lifecycle status is
+      // assigned server-side under admin authority in the pay-gateway adapter).
+      allow update: if isStaff() && (isSuperAdmin() || isAdmin());
+
+      allow delete: if isStaff() && (isSuperAdmin() || isAdmin());
+    }
+
+    // ── Sponsorships ─────────────────────────────────────────────────
+    match /sponsorships/{id} {
+      // Public when publiclyListed and active/completed; admin always
+      allow read: if (resource.data.publiclyListed == true
+          && resource.data.status in ['ACTIVE', 'COMPLETED'])
+        || (isStaff() && (isSuperAdmin() || isAdmin()));
+
+      allow create: if isStaff();
+
+      allow update: if isStaff() && (
+        isSuperAdmin() || isAdmin()
+        || (isCM()
+          && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'publiclyListed', 'adminNotes', 'contactInfo'
+          ])
+        )
+      );
+
+      allow delete: if isStaff() && (isSuperAdmin() || isAdmin());
+    }
+
+    // ── Contact Messages ─────────────────────────────────────────────
+    match /contactMessages/{id} {
+      allow read: if isStaff() && (isSuperAdmin() || isAdmin());
+
+      allow create: if !isSignedIn()
+        && request.resource.data.status == 'PENDING'
+        && request.resource.data.consentGiven == true
+        && request.resource.data.antiSpamToken is string
+        && request.resource.data.antiSpamToken.size() > 0
+        && !request.resource.data.keys().hasAny(['adminNotes', 'reviewHistory', 'processedBy']);
+
+      allow update: if isStaff() && (isSuperAdmin() || isAdmin());
+
+      allow delete: if isStaff() && (isSuperAdmin() || isAdmin());
+    }
+
+    // ── Donation Pledges ─────────────────────────────────────────────
+    match /donationPledges/{id} {
+      allow read: if isStaff() && (isSuperAdmin() || isAdmin());
+
+      allow create: if !isSignedIn()
+        && request.resource.data.status == 'PENDING'
+        && request.resource.data.consentGiven == true
+        && request.resource.data.antiSpamToken is string
+        && request.resource.data.antiSpamToken.size() > 0
+        && !request.resource.data.keys().hasAny(['adminNotes', 'reviewHistory', 'processedBy']);
+
+      allow update: if isStaff() && (isSuperAdmin() || isAdmin());
+
+      allow delete: if isStaff() && (isSuperAdmin() || isAdmin());
+    }
+
+    // ── Payment Records (universal ledger, server-owned) ──────────────
+    // Payments are recorded ONLY by the payment server (PHP gateway) using a
+    // Firebase service account. Clients — including anonymous users and staff
+    // browsers — can never create/update/delete here; those paths are denied by
+    // default and made explicit below so the server-only contract is auditable.
+    // Staff may read for the admin ledger; PAID/REFUNDED/paymentId/orderId are
+    // authored exclusively server-side, never by any client.
+    match /paymentRecords/{id} {
+      allow read: if isStaff() && (isSuperAdmin() || isAdmin());
+
+      allow create, update, delete: if false;
+    }
+  }
+}

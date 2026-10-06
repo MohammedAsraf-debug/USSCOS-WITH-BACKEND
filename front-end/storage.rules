@@ -1,0 +1,18 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // USSCOS does not use Firebase Storage (see PHASE_0 baseline):
+    // - public media goes through Cloudinary (unsigned presets),
+    // - private applicant documents go through the Node backend's private
+    //   filesystem (never Storage, never public URLs).
+    // This file is intentionally dormant (firebase.json has no storage
+    // section) and denies everything explicitly so a future accidental
+    // deploy can never open client access. To use Storage, add narrowly
+    // scoped path rules here AND wire firebase.json — never open `/**`.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
