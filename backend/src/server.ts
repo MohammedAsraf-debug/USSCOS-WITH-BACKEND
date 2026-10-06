@@ -44,10 +44,31 @@ async function boot(): Promise<void> {
     console.warn("Razorpay credentials missing: payment endpoints will return 503 NOT_CONFIGURED.");
   }
   await mkdir(config.privateStoragePath, { recursive: true });
+  console.log(`Private document storage: ${config.privateStoragePath}`);
   const app = createApp({ config, gateway, verifier, razorpay, storagePath: config.privateStoragePath, users });
-  app.listen(config.port, () => {
+  const server = app.listen(config.port, () => {
     console.log(`usscos-backend listening on :${config.port} (env=${config.nodeEnv})`);
   });
+  // Graceful shutdown: stop accepting new connections on SIGTERM/SIGINT so
+  // in-flight uploads/payments can finish, then force-exit after 10 s so a
+  // hung socket can never block a host restart indefinitely.
+  let shuttingDown = false;
+  const shutdown = (signal: NodeJS.Signals) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`Received ${signal}: draining incoming connections…`);
+    const force = setTimeout(() => {
+      console.error("Graceful shutdown timed out; forcing exit.");
+      process.exit(1);
+    }, 10000);
+    force.unref?.();
+    server.close(() => {
+      clearTimeout(force);
+      process.exit(0);
+    });
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
 const isMain = process.argv[1] ? import.meta.url === pathToFileURL(process.argv[1]).href : false;

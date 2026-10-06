@@ -529,8 +529,7 @@ describe("payment security", () => {
     expect(razorpay.orders).toHaveLength(0);
   });
 
-  it("rejects missing idempotency key, missing token, and non-INR currency", async () => {
-    const noKey = await request(app).post("/api/payments/orders").send(orderBody({ idempotencyKey: "" }));
+  it("rejects missing idempotency key, missing token, and non-INR currency", async () => {    const noKey = await request(app).post("/api/payments/orders").send(orderBody({ idempotencyKey: "" }));
     expect(noKey.status).toBe(400);
     expect(noKey.body.code).toBe("MISSING_IDEMPOTENCY");
     const noToken = await request(app)
@@ -574,5 +573,161 @@ describe("payment primitives", () => {
     expect(canTransition("PAID", "INITIATED")).toBe(false);
     expect(canTransition("INITIATED", "INITIATED")).toBe(false);
     expect(canTransition("UNKNOWN", "PAID")).toBe(false);
+  });
+});
+
+describe("payment API hardening", () => {
+  let app: ReturnType<typeof createApp>;
+  let gateway: MemoryFirestoreGateway;
+  let razorpay: FakeRazorpay;
+  beforeEach(() => {
+    ({ app, gateway, razorpay } = setup());
+  });
+
+  async function seedPaid(key: string): Promise<string> {
+    await gateway.set("users", "admin-1", { status: "active", role: "ADMIN" });
+    const order = await request(app).post("/api/payments/orders").send(orderBody({ idempotencyKey: key }));
+    expect(order.status).toBe(200);
+    const orderId = String(order.body.order_id);
+    const verified = await request(app).post("/api/payments/verify").send({
+      orderId,
+      paymentId: "pay_test1",
+      signature: sig(orderId, "pay_test1"),
+    });
+    expect(verified.status).toBe(200);
+    return orderId;
+  }
+
+  const refund = (orderId: string, idToken = "admin-token") =>
+    request(app).post("/api/payments/refund").send({ recordId: orderId, idToken });
+
+  it("concurrent refunds execute exactly once (second is rejected)", async () => {
+    const orderId = await seedPaid("idem-conc-refund-1");
+    const results = await Promise.all([refund(orderId), refund(orderId)]);
+    const statuses = results.map((r) => r.status).sort();
+    expect(statuses).toEqual([200, 409]);
+    expect(razorpay.refunds).toHaveLength(1);
+    const rec = await gateway.get("paymentRecords", orderId);
+    expect(rec?.paymentStatus).toBe("REFUNDED");
+    expect((rec?.refund as Record<string, unknown>)?.refundId).toBe("rfnd_test1");
+  });
+
+  it("stale refund reservation is reclaimed after TTL", async () => {
+    const orderId = await seedPaid("idem-stale-refund-1");
+    await gateway.set("paymentRefundReservations", orderId, {
+      orderId,
+      byUid: "crashed-holder",
+      createdAt: new Date(Date.now() - 20 * 60 * 1000).toISOString(),
+      updatedAt: new Date(Date.now() - 20 * 60 * 1000).toISOString(),
+    });
+    const res = await refund(orderId);
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("REFUNDED");
+    expect(razorpay.refunds).toHaveLength(1);
+  });
+
+  it("refund ignores attacker-supplied amount and status fields", async () => {
+    const orderId = await seedPaid("idem-refund-fields-1");
+    const res = await request(app).post("/api/payments/refund").send({
+      recordId: orderId,
+      idToken: "admin-token",
+      amount: 1,
+      amountPaise: 1,
+      paymentStatus: "PENDING",
+      status: "INITIATED",
+    });
+    expect(res.status).toBe(200);
+    expect(razorpay.refunds).toHaveLength(1);
+    expect(razorpay.refunds[0]?.amountPaise).toBe(50000);
+    const rec = await gateway.get("paymentRecords", orderId);
+    expect(rec?.paymentStatus).toBe("REFUNDED");
+    expect(Number(rec?.amountPaise)).toBe(50000);
+  });
+
+  it("oversized JSON bodies are rejected with 413, not 500", async () => {
+    const big = JSON.stringify({ ...orderBody({ idempotencyKey: "idem-big-1" }), pad: "x".repeat(2 * 1024 * 1024) });
+    const res = await request(app)
+      .post("/api/payments/orders")
+      .set("Content-Type", "application/json")
+      .send(big);
+    expect(res.status).toBe(413);
+    expect(res.body.code).toBe("PAYLOAD_TOO_LARGE");
+    expect(gateway.count("paymentRecords")).toBe(0);
+  });
+
+  it("prototype-pollution keys in payload are stripped, record stays clean", async () => {
+    const raw = JSON.parse(
+      '{"purpose":"DONATION","amount":500,"currency":"INR",' +
+        '"customer":{"name":"Jane"},"entity":{"kind":"x","id":"y"},' +
+        '"idempotencyKey":"idem-proto-1","antiSpamToken":"t",' +
+        '"payload":{"__proto__":{"polluted":true},"note":"hi"}}',
+    ) as Record<string, unknown>;
+    const res = await request(app).post("/api/payments/orders").send(raw);
+    expect(res.status).toBe(200);
+    const rec = await gateway.get("paymentRecords", String(res.body.order_id));
+    const stored = rec?.payload as Record<string, unknown>;
+    expect(Object.hasOwn(stored, "__proto__")).toBe(false);
+    expect(Object.getPrototypeOf(stored)).toBe(Object.prototype);
+    expect(stored.note).toBe("hi");
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it("unsupported methods on POST-only endpoints return 404", async () => {
+    for (const method of ["put", "patch", "delete"] as const) {
+      const orders = await (request(app)[method]("/api/payments/orders").send({}) as unknown as Promise<{ status: number }>);
+      expect(orders.status).toBe(404);
+      const apps = await (request(app)[method]("/api/applications").send({}) as unknown as Promise<{ status: number }>);
+      expect(apps.status).toBe(404);
+    }
+  });
+
+  it("unknown endpoints return 404 without leaking internals", async () => {
+    const res = await request(app).get("/api/nope");
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe("NOT_FOUND");
+    expect(JSON.stringify(res.body)).not.toContain("Error");
+  });
+});
+
+describe("HTTP security surface", () => {
+  function corsApp() {
+    return createApp({
+      config: testConfig({ frontendOrigins: ["https://app.test"] }),
+      gateway: new MemoryFirestoreGateway(),
+      verifier: new FakeVerifier(),
+      razorpay: new FakeRazorpay(),
+      storagePath: testConfig().privateStoragePath,
+      users: new FakeAdminAuth(),
+    });
+  }
+
+  it("rejects unknown origins with 403 and no ACAO header", async () => {
+    const res = await request(corsApp()).get("/health").set("Origin", "http://attacker.example");
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("ORIGIN_FORBIDDEN");
+    expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("echoes the allowlisted origin exactly with credentials allowed", async () => {
+    const res = await request(corsApp()).get("/health").set("Origin", "https://app.test");
+    expect(res.status).toBe(200);
+    expect(res.headers["access-control-allow-origin"]).toBe("https://app.test");
+    expect(res.headers["access-control-allow-credentials"]).toBe("true");
+    expect(String(res.headers.vary ?? "")).toContain("Origin");
+  });
+
+  it("never emits a wildcard origin", async () => {
+    const res = await request(corsApp())
+      .post("/api/payments/orders")
+      .set("Origin", "https://app.test")
+      .send(orderBody({ idempotencyKey: "idem-cors-1" }));
+    expect(res.headers["access-control-allow-origin"]).not.toBe("*");
+  });
+
+  it("emits helmet hardening headers", async () => {
+    const res = await request(corsApp()).get("/health");
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    expect(res.headers["x-frame-options"]).toBe("SAMEORIGIN");
+    expect(res.headers["x-powered-by"]).toBeUndefined();
   });
 });

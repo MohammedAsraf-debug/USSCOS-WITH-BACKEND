@@ -42,6 +42,11 @@ export function errorMiddleware(
     sendError(res, 400, "INVALID_PAYLOAD", "Malformed JSON payload.");
     return;
   }
+  // Oversized JSON bodies (express.json limit exceeded).
+  if (err !== null && typeof err === "object" && (err as { type?: unknown }).type === "entity.too.large") {
+    sendError(res, 413, "PAYLOAD_TOO_LARGE", "Request body too large.");
+    return;
+  }
   // Deliberately generic: no stack traces, no internals.
   sendError(res, 500, "SERVER_ERROR", "Unexpected server error.");
 }

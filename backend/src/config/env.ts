@@ -1,4 +1,5 @@
 /** Central environment loading. Placeholders only live in .env.example. */
+import path from "node:path";
 
 export interface BackendConfig {
   nodeEnv: string;
@@ -41,7 +42,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BackendConfig 
     razorpayKeySecret: keySecret,
     // Webhook HMAC defaults to the key secret (matches the legacy PHP server).
     razorpayWebhookSecret: env.RAZORPAY_WEBHOOK_SECRET ?? keySecret,
-    privateStoragePath: env.PRIVATE_STORAGE_PATH ?? "./storage/private",
+    // Absolute path: the server must not depend on the process working
+    // directory (hosts may start it from anywhere). A configured relative
+    // path resolves against cwd at boot; the resolved value is logged once.
+    privateStoragePath: path.resolve(env.PRIVATE_STORAGE_PATH ?? "./storage/private"),
     turnstileSecret: env.TURNSTILE_SECRET ?? "",
     minAmountInr: num(env.MIN_AMOUNT_INR, 1),
     maxAmountInr: num(env.MAX_AMOUNT_INR, 1000000),

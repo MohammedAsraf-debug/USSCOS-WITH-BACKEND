@@ -67,6 +67,9 @@ export class HttpRazorpayGateway implements RazorpayGateway {
         Accept: "application/json",
       },
       body: payload ? JSON.stringify(payload) : undefined,
+      // Bounded so a hung upstream cannot hold a request (and its caller)
+      // open indefinitely; failures surface as gateway errors downstream.
+      signal: AbortSignal.timeout(30000),
     });
 
     let body: Record<string, unknown> = {};

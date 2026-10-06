@@ -105,13 +105,42 @@ export function normalizeOrderInput(
         id: String(entityRaw.id ?? "").trim(),
         title: String(entityRaw.title ?? "").trim(),
       },
-      payload: (raw.payload !== null && typeof raw.payload === "object" && !Array.isArray(raw.payload)
-        ? (raw.payload as Record<string, unknown>)
-        : {}),
+      // Free-form passthrough, scrubbed of prototype-pollution keys (see below).
+      payload: sanitizeJson(
+        raw.payload !== null && typeof raw.payload === "object" && !Array.isArray(raw.payload)
+          ? (raw.payload as Record<string, unknown>)
+          : {},
+      ) as Record<string, unknown>,
       antiSpamToken,
       idempotencyKey: String(raw.idempotencyKey ?? ""),
     },
   };
+}
+
+/**
+ * Deep-strip prototype-pollution keys from caller-supplied JSON. The `payload`
+ * field is stored verbatim, so `__proto__`/`constructor`/`prototype` keys
+ * (own properties via JSON.parse) must never reach the record — otherwise a
+ * later read-merge could swap an object's prototype. Depth-capped to bound
+ * recursion on hostile nesting.
+ */
+const UNSAFE_JSON_KEYS: ReadonlySet<string> = new Set(["__proto__", "constructor", "prototype"]);
+
+function sanitizeJson(value: unknown, depth = 0): unknown {
+  if (Array.isArray(value)) {
+    if (depth > 10) return [];
+    return value.map((item) => sanitizeJson(item, depth + 1));
+  }
+  if (value !== null && typeof value === "object") {
+    if (depth > 10) return {};
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      if (UNSAFE_JSON_KEYS.has(key)) continue;
+      out[key] = sanitizeJson(entry, depth + 1);
+    }
+    return out;
+  }
+  return value;
 }
 
 function nowIso(): string {
@@ -226,6 +255,8 @@ export async function createOrderFlow(deps: PaymentServiceDeps, body: Record<str
   return claimReservation(deps, input, 0);
 }
 export const RESERVATIONS_COLLECTION = "paymentIdempotency";
+/** Reservations for in-flight refunds (prevents double execution). */
+export const REFUND_RESERVATIONS_COLLECTION = "paymentRefundReservations";
 /** Stale-claim horizon: a reservation without an order older than this may be reclaimed. */
 export const RESERVATION_TTL_MS = 5 * 60 * 1000;
 /** How long concurrent losers wait for the winner's order before giving up. */
@@ -241,9 +272,12 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function reservationFresh(createdAt: unknown): boolean {
-  return typeof createdAt === "string" && Date.parse(createdAt) + RESERVATION_TTL_MS >= Date.now();
+function reservationFresh(createdAt: unknown, ttlMs: number = RESERVATION_TTL_MS): boolean {
+  return typeof createdAt === "string" && Date.parse(createdAt) + ttlMs >= Date.now();
 }
+
+/** Stale-claim horizon for in-flight refunds (crashed holder reclaim). */
+export const REFUND_TTL_MS = 10 * 60 * 1000;
 
 /**
  * Atomic claim step for one idempotency key. A single atomic createWithId on
@@ -468,9 +502,46 @@ export async function verifyFlow(
   return { status: 200, body: successPayload(orderId, paymentId, completeAt) };
 }
 
-/** POST /api/payments/refund — SUPER_ADMIN/ADMIN only. */
-export async function refundFlow(
+/**
+ * Atomically claim the single refund execution slot for an order. Exactly
+ * one concurrent refund proceeds; the others resolve from current state
+ * (already-refunded → NOT_PAID, still-PAID → in-progress conflict).
+ * Stale slots (crashed holder) are reclaimed once past the TTL.
+ * Returns a terminal outcome, or null when this caller won the slot.
+ */
+async function claimRefundSlot(
   deps: PaymentServiceDeps,
+  orderId: string,
+  uid: string,
+  attempt: number,
+): Promise<ServiceOutcome | null> {
+  const stamped = nowIso();
+  try {
+    await deps.gateway.createWithId(REFUND_RESERVATIONS_COLLECTION, orderId, {
+      orderId,
+      byUid: uid,
+      createdAt: stamped,
+      updatedAt: stamped,
+    });
+    return null;
+  } catch (err) {
+    if (!isAlreadyExists(err)) throw err;
+  }
+  const current = await deps.gateway.get(PAYMENT_COLLECTION, orderId).catch(() => null);
+  if (current && current.paymentStatus === "REFUNDED") {
+    return err(409, "NOT_PAID", "Only captured payments can be refunded");
+  }
+  const hold = await deps.gateway.get(REFUND_RESERVATIONS_COLLECTION, orderId).catch(() => null);
+  if (hold && reservationFresh(hold.createdAt, REFUND_TTL_MS)) {
+    return err(409, "STATE_CONFLICT", "A refund for this order is already in progress. Please wait a moment and try again.");
+  }
+  await deps.gateway.remove(REFUND_RESERVATIONS_COLLECTION, orderId).catch(() => undefined);
+  if (attempt < 1) return claimRefundSlot(deps, orderId, uid, attempt + 1);
+  return err(409, "STATE_CONFLICT", "A refund for this order is already in progress. Please wait a moment and try again.");
+}
+
+/** POST /api/payments/refund — SUPER_ADMIN/ADMIN only. */
+export async function refundFlow(  deps: PaymentServiceDeps,
   body: Record<string, unknown>,
 ): Promise<ServiceOutcome> {
   const idToken = String(body.idToken ?? "");
@@ -489,10 +560,15 @@ export async function refundFlow(
   }
   const paymentId = String(rec.paymentId ?? "");
   if (!paymentId) return err(409, "NO_PAYMENT_ID", "No Razorpay payment id captured");
+  const slot = await claimRefundSlot(deps, orderId, actor.uid, 0);
+  if (slot) return slot;
   let refund: Record<string, unknown>;
   try {
     refund = await deps.razorpay.createRefund(paymentId, Number(rec.amountPaise ?? 0));
   } catch (err) {
+    // Release the slot so a later retry may proceed; the failed attempt
+    // created no server-side refund state to reconcile.
+    await deps.gateway.remove(REFUND_RESERVATIONS_COLLECTION, orderId).catch(() => undefined);
     return gatewayFailure(deps.debug, "Razorpay refund creation failed", err);
   }
   const refundId = String(refund.id ?? "");
